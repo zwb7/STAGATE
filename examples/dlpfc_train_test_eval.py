@@ -128,7 +128,7 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
     count_file = (
         args.count_file
         if args.count_file
-        else f"{args.section_id}_filtered_feature_bc_matrix.h5"
+        else f"filtered_feature_bc_matrix.h5"
     )
     truth_file = (
         Path(args.truth_file)
