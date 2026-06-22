@@ -1,0 +1,65 @@
+# Data
+Data/
+data/
+dataset/
+*.h5
+*.h5ad
+*.loom
+*.npy
+*.npz
+*.csv
+*.tsv
+
+# Training outputs and models
+outputs/
+results/
+runs/
+logs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+events.out.tfevents.*
+
+# Generated figures and document files
+docs/
+figures/
+images/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+
+# Keep essential repository documentation
+!README.md
+!README.rst
+!LICENSE
+
+# Python caches, builds, and environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Jupyter and local configuration
+.ipynb_checkpoints/
+.env
+.env.*
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
