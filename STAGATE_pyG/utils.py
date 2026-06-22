@@ -229,6 +229,13 @@ def mclust_R(adata, num_cluster, modelNames='EEE', used_obsm='STAGATE', random_s
         ncol=embedding.shape[1],
         byrow=True,
     )
+    r_embedding = robjects.r['colnames<-'](
+        r_embedding,
+        StrVector([
+            'STAGATE_%d' % (index + 1)
+            for index in range(embedding.shape[1])
+        ]),
+    )
     res = rmclust(
         r_embedding,
         G=IntVector([num_cluster]),
