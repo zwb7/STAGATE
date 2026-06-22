@@ -93,7 +93,7 @@ def train_STAGATE(adata, hidden_dims=[512, 30], n_epochs=1000, lr=0.001, key_add
     adata.obsm[key_added] = STAGATE_rep
 
     if save_loss:
-        adata.uns['STAGATE_loss'] = loss
+        adata.uns['STAGATE_loss'] = float(loss.detach().cpu().item())
     if save_reconstrction:
         ReX = out.to('cpu').detach().numpy()
         ReX[ReX<0] = 0
