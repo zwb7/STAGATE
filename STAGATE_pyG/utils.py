@@ -204,23 +204,38 @@ def mclust_R(adata, num_cluster, modelNames='EEE', used_obsm='STAGATE', random_s
     Clustering using the mclust algorithm.
     The parameters are the same as those in the R package mclust.
     """
-    
+
     np.random.seed(random_seed)
     import rpy2.robjects as robjects
-    from rpy2.robjects import default_converter, numpy2ri
-    from rpy2.robjects.conversion import localconverter
-    robjects.r.library("mclust")
+    from rpy2.robjects.vectors import FloatVector, IntVector, StrVector
 
+    robjects.r.library("mclust")
     r_random_seed = robjects.r['set.seed']
     r_random_seed(random_seed)
     rmclust = robjects.r['Mclust']
 
-    embedding = np.asarray(adata.obsm[used_obsm])
-    with localconverter(default_converter + numpy2ri.converter):
-        res = rmclust(embedding, num_cluster, modelNames=modelNames)
-        mclust_res = np.asarray(res.rx2('classification'))
+    embedding = np.asarray(adata.obsm[used_obsm], dtype=np.float64)
+    if embedding.ndim != 2:
+        raise ValueError(
+            "%s must be two-dimensional, got shape %s."
+            % (used_obsm, embedding.shape)
+        )
+    if not np.isfinite(embedding).all():
+        raise ValueError("%s contains NaN or infinite values." % used_obsm)
+
+    r_embedding = robjects.r['matrix'](
+        FloatVector(embedding.ravel(order='C')),
+        nrow=embedding.shape[0],
+        ncol=embedding.shape[1],
+        byrow=True,
+    )
+    res = rmclust(
+        r_embedding,
+        G=IntVector([num_cluster]),
+        modelNames=StrVector([modelNames]),
+    )
+    mclust_res = np.asarray(list(res.rx2('classification')), dtype=int)
 
     adata.obs['mclust'] = mclust_res
-    adata.obs['mclust'] = adata.obs['mclust'].astype('int')
     adata.obs['mclust'] = adata.obs['mclust'].astype('category')
     return adata
