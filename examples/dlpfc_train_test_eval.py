@@ -166,7 +166,7 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         weight_decay=args.weight_decay,
         random_seed=args.seed,
         save_loss=True,
-        save_reconstrction=True,
+        save_reconstrction=False,
         device=device,
     )
 
