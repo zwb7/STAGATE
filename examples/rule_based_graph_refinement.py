@@ -1,9 +1,10 @@
-"""Evaluate STAGATE with expression- or embedding-similarity graph pruning.
+"""Evaluate STAGATE with original or rule-refined spatial graphs.
 
 The script reads a baseline ``.h5ad`` so preprocessing, highly variable genes,
 node order, warm-up embeddings, and the original spatial graph are identical
-to the official baseline. It scores only existing spatial edges, applies
-node-local top-ratio pruning with minimum-degree protection, and reinitializes
+to the official baseline. The ``original`` method performs an unchanged-graph
+re-encoding control. Other methods score only existing spatial edges, apply
+node-local top-ratio pruning with minimum-degree protection, and reinitialize
 the official STAGATE model on the refined graph.
 """
 
@@ -31,12 +32,12 @@ from sklearn.metrics import adjusted_rand_score
 
 import STAGATE_pyG as STAGATE
 
-Method = Literal["expression", "embedding"]
+Method = Literal["original", "expression", "embedding"]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run expression- or embedding-similarity graph refinement."
+        description="Run original-graph control or similarity graph refinement."
     )
     parser.add_argument(
         "--input-h5ad",
@@ -48,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clusters", type=int, required=True)
     parser.add_argument(
         "--method",
-        choices=["expression", "embedding"],
+        choices=["original", "expression", "embedding"],
         required=True,
     )
     parser.add_argument(
@@ -481,6 +482,39 @@ def build_refined_graph(
     return refined_graph, pairs, node_selection, graph_report
 
 
+def build_original_graph_control(
+    adata: sc.AnnData,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    original_graph = adata.uns["Spatial_Net"].loc[
+        :,
+        ["Cell1", "Cell2", "Distance"],
+    ].copy()
+    stats = graph_connectivity_stats(original_graph, adata.obs_names)
+    graph_report: dict[str, object] = {
+        "method": "original",
+        "requested_retain_ratio": 1.0,
+        "minimum_degree": None,
+        "selection_policy": "unchanged_original_graph",
+        "original_directed_edge_count": stats["n_directed_edges"],
+        "retained_directed_edge_count": stats["n_directed_edges"],
+        "original_undirected_edge_count": stats["n_undirected_edges"],
+        "retained_undirected_edge_count": stats["n_undirected_edges"],
+        "directed_edge_retention_ratio": 1.0,
+        "undirected_edge_retention_ratio": 1.0,
+        "original_isolated_node_count": stats["isolated_node_count"],
+        "refined_isolated_node_count": stats["isolated_node_count"],
+        "original_connected_component_count": stats["connected_component_count"],
+        "refined_connected_component_count": stats["connected_component_count"],
+        "original_largest_component_ratio": stats["largest_component_ratio"],
+        "refined_largest_component_ratio": stats["largest_component_ratio"],
+        "original_mean_undirected_degree": stats["mean_undirected_degree"],
+        "refined_mean_undirected_degree": stats["mean_undirected_degree"],
+        "original_minimum_undirected_degree": stats["minimum_undirected_degree"],
+        "refined_minimum_undirected_degree": stats["minimum_undirected_degree"],
+    }
+    return original_graph, pd.DataFrame(), pd.DataFrame(), graph_report
+
+
 def clear_baseline_outputs(adata: sc.AnnData) -> None:
     if "mclust" in adata.obs:
         del adata.obs["mclust"]
@@ -541,14 +575,19 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         args.method,
     )
 
-    refined_graph, edge_scores, node_selection, graph_report = (
-        build_refined_graph(
-            adata,
-            args.method,
-            args.retain_ratio,
-            args.minimum_degree,
+    if args.method == "original":
+        refined_graph, edge_scores, node_selection, graph_report = (
+            build_original_graph_control(adata)
         )
-    )
+    else:
+        refined_graph, edge_scores, node_selection, graph_report = (
+            build_refined_graph(
+                adata,
+                args.method,
+                args.retain_ratio,
+                args.minimum_degree,
+            )
+        )
     print(
         f"{args.method} graph: "
         f"{graph_report['original_undirected_edge_count']} -> "
@@ -557,14 +596,15 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         f"{graph_report['undirected_edge_retention_ratio']:.4f})"
     )
 
-    edge_scores.loc[
-        :,
-        ["pair_id", "node_a", "node_b", "distance", "score", "selected"],
-    ].to_csv(output_dir / "edge_scores.csv", index=False)
-    node_selection["spot_id"] = np.asarray(adata.obs_names.astype(str))[
-        node_selection["node_index"].to_numpy(dtype=int)
-    ]
-    node_selection.to_csv(output_dir / "node_selection.csv", index=False)
+    if args.method != "original":
+        edge_scores.loc[
+            :,
+            ["pair_id", "node_a", "node_b", "distance", "score", "selected"],
+        ].to_csv(output_dir / "edge_scores.csv", index=False)
+        node_selection["spot_id"] = np.asarray(adata.obs_names.astype(str))[
+            node_selection["node_index"].to_numpy(dtype=int)
+        ]
+        node_selection.to_csv(output_dir / "node_selection.csv", index=False)
     refined_graph.to_csv(output_dir / "refined_spatial_net.csv", index=False)
     with (output_dir / "graph_metrics.json").open(
         "w",
@@ -618,11 +658,11 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
     if baseline_ari is not None:
         print(f"Baseline ARI: {baseline_ari:.4f}; Delta ARI: {delta_ari:+.4f}")
 
-    method_title = (
-        "Expression similarity"
-        if args.method == "expression"
-        else "Embedding similarity"
-    )
+    method_title = {
+        "original": "Original graph re-encoding",
+        "expression": "Expression similarity",
+        "embedding": "Embedding similarity",
+    }[args.method]
     sc.pl.umap(
         adata,
         color=["mclust", args.ground_truth_key],
@@ -647,7 +687,11 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
 
     result = {
         "sample_id": args.sample_id,
-        "method": f"{args.method}_similarity_refinement",
+        "method": (
+            "original_graph_reencoding"
+            if args.method == "original"
+            else f"{args.method}_similarity_refinement"
+        ),
         "uses_ground_truth_for_refinement": False,
         "input_h5ad": str(args.input_h5ad),
         "ground_truth_key": args.ground_truth_key,
@@ -659,11 +703,15 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         "baseline_metrics": baseline_metrics_path,
         "rule_based_ari": float(rule_based_ari),
         "delta_ari": delta_ari,
-        "requested_retain_ratio": args.retain_ratio,
+        "requested_retain_ratio": (
+            1.0 if args.method == "original" else args.retain_ratio
+        ),
         "actual_edge_retention_ratio": graph_report[
             "undirected_edge_retention_ratio"
         ],
-        "minimum_degree": args.minimum_degree,
+        "minimum_degree": (
+            None if args.method == "original" else args.minimum_degree
+        ),
         "refined_isolated_node_count": graph_report[
             "refined_isolated_node_count"
         ],
@@ -676,9 +724,12 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         "weight_decay": args.weight_decay,
     }
 
-    output_h5ad = output_dir / (
-        f"{args.sample_id}_{args.method}_similarity_stagate.h5ad"
+    output_suffix = (
+        "original_reencoding"
+        if args.method == "original"
+        else f"{args.method}_similarity"
     )
+    output_h5ad = output_dir / f"{args.sample_id}_{output_suffix}_stagate.h5ad"
     adata.write_h5ad(output_h5ad)
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as file:
         json.dump(result, file, indent=2, ensure_ascii=False)
