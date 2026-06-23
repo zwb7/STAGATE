@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--device",
         default="cuda:7",
