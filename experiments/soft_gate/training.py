@@ -257,8 +257,8 @@ def train_soft_gate_stagate(
 ) -> SoftGateTrainingResult:
     if warmup_epochs < 0:
         raise ValueError("warmup_epochs must be non-negative")
-    if gate_epochs <= 0:
-        raise ValueError("gate_epochs must be positive")
+    if gate_epochs < 0:
+        raise ValueError("gate_epochs must be non-negative")
     if len(hidden_dims) != 2:
         raise ValueError("hidden_dims must contain [hidden_dim, latent_dim]")
     if not 0.0 <= rho < 1.0:
@@ -342,7 +342,18 @@ def train_soft_gate_stagate(
     non_self = ~training_data.edge_is_self_loop
     shuffle_permutation = torch.randperm(int(non_self.sum()), device=device)
 
-    last_losses: dict[str, Tensor] = {}
+    if warmup_history:
+        last_warmup = warmup_history[-1]
+        last_losses: dict[str, Tensor] = {
+            "total_loss": torch.tensor(float(last_warmup["total_loss"]), device=device),
+            "reconstruction_loss": torch.tensor(
+                float(last_warmup["reconstruction_loss"]),
+                device=device,
+            ),
+            "budget_loss": torch.tensor(0.0, device=device),
+        }
+    else:
+        last_losses = {}
     final_edge_gate = None
     for epoch in iterator:
         model.train()

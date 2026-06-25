@@ -114,6 +114,46 @@ def _loss_dict_to_float(losses: Dict[str, torch.Tensor]) -> Dict[str, float]:
     return {key: float(value.detach().cpu().item()) for key, value in losses.items()}
 
 
+def _tensor_summary(prefix: str, value: torch.Tensor) -> Dict[str, float]:
+    value = value.detach().float().cpu()
+    quantiles = torch.quantile(
+        value,
+        torch.tensor([0.01, 0.05, 0.50, 0.95, 0.99], dtype=value.dtype),
+    )
+    return {
+        prefix + "_min": float(value.min().item()),
+        prefix + "_mean": float(value.mean().item()),
+        prefix + "_max": float(value.max().item()),
+        prefix + "_p01": float(quantiles[0].item()),
+        prefix + "_p05": float(quantiles[1].item()),
+        prefix + "_p50": float(quantiles[2].item()),
+        prefix + "_p95": float(quantiles[3].item()),
+        prefix + "_p99": float(quantiles[4].item()),
+    }
+
+
+def _gate_logit(edge_gate: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    edge_gate = edge_gate.detach().clamp(eps, 1.0 - eps)
+    return torch.log(edge_gate) - torch.log1p(-edge_gate)
+
+
+def _preserve_mask_fraction(
+    assignment: torch.Tensor,
+    edge_index: torch.Tensor,
+    boundary_score: torch.Tensor,
+    consistency_threshold: float,
+    boundary_threshold: torch.Tensor,
+) -> float:
+    src = edge_index[0]
+    dst = edge_index[1]
+    consistency = (assignment[src] * assignment[dst]).sum(dim=1)
+    preserve_mask = (
+        (consistency > consistency_threshold)
+        & (boundary_score[src] < boundary_threshold)
+        & (boundary_score[dst] < boundary_threshold)
+    )
+    return float(preserve_mask.float().mean().detach().cpu().item())
+
 def train_e3v3(
     adata,
     n_clusters: int,
@@ -241,12 +281,36 @@ def train_e3v3(
     adata.obs[key_added + "_is_boundary"] = boundary.mask.detach().cpu().numpy()
 
     adata.uns[key_added + "_config"] = json.loads(json.dumps(asdict(config)))
+    gate_logit = _gate_logit(final_gate)
+    final_losses = stage2_losses[-1] if stage2_losses else {}
     adata.uns[key_added + "_diagnostics"] = {
         "boundary_threshold": float(boundary.threshold.detach().cpu().item()),
         "boundary_fraction": float(boundary.mask.float().mean().detach().cpu().item()),
-        "gate_mean": float(final_gate.mean().detach().cpu().item()),
-        "gate_min": float(final_gate.min().detach().cpu().item()),
-        "gate_max": float(final_gate.max().detach().cpu().item()),
+        "gate_suppression_mean": float((1.0 - final_gate).mean().detach().cpu().item()),
+        "gate_budget_target_rho": float(config.gate_rho),
+        "gate_beta": float(model.edge_gate.beta.detach().cpu().item()),
+        "gate_gamma": float(model.edge_gate.gamma.detach().cpu().item()),
+        "lambda_boundary": float(config.lambda_boundary),
+        "lambda_gate": float(config.lambda_gate),
+        "lambda_preserve": float(config.lambda_preserve),
+        "preserve_consistency_threshold": float(config.preserve_consistency_threshold),
+        "preserve_mask_fraction": _preserve_mask_fraction(
+            assignment,
+            data.edge_index,
+            boundary.scores,
+            config.preserve_consistency_threshold,
+            boundary.threshold,
+        ),
+        "final_loss_rec": float(final_losses.get("rec", np.nan)),
+        "final_loss_boundary": float(final_losses.get("boundary", np.nan)),
+        "final_loss_gate": float(final_losses.get("gate", np.nan)),
+        "final_loss_preserve": float(final_losses.get("preserve", np.nan)),
+        "final_loss_total": float(final_losses.get("total", np.nan)),
+        "final_weighted_loss_boundary": float(config.lambda_boundary * final_losses.get("boundary", np.nan)),
+        "final_weighted_loss_gate": float(config.lambda_gate * final_losses.get("gate", np.nan)),
+        "final_weighted_loss_preserve": float(config.lambda_preserve * final_losses.get("preserve", np.nan)),
+        **_tensor_summary("gate", final_gate),
+        **_tensor_summary("gate_logit", gate_logit),
     }
     if save_loss:
         adata.uns[key_added + "_warmup_loss"] = np.asarray(warmup_losses, dtype=np.float32)

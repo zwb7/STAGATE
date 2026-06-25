@@ -135,12 +135,12 @@ def default_original_metrics(sample_id: str) -> Path:
 def validate_args(args: argparse.Namespace) -> None:
     if args.gate_dim <= 0:
         raise ValueError("--gate-dim must be positive")
-    if args.epochs is not None and args.epochs <= 0:
-        raise ValueError("--epochs must be positive")
+    if args.epochs is not None and args.epochs < 0:
+        raise ValueError("--epochs must be non-negative")
     if args.warmup_epochs < 0:
         raise ValueError("--warmup-epochs must be non-negative")
-    if args.gate_epochs <= 0:
-        raise ValueError("--gate-epochs must be positive")
+    if args.gate_epochs < 0:
+        raise ValueError("--gate-epochs must be non-negative")
     if not 0.0 <= args.rho < 1.0:
         raise ValueError("--rho must be in [0, 1)")
     if not 0.0 <= args.g_min < 1.0:
