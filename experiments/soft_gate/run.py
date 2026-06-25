@@ -28,6 +28,7 @@ from experiments.soft_gate.features import build_asg_edge_priors, validate_warmu
 from experiments.soft_gate.training import canonical_variant, train_soft_gate_stagate
 
 VARIANTS = [
+    "baseline",
     "extra_training",
     "current_gate_only",
     "stabilized_unnormalized",

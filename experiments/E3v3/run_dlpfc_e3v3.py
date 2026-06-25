@@ -28,6 +28,10 @@ def parse_args():
     parser.add_argument("--lambda-boundary", type=float, default=0.1)
     parser.add_argument("--lambda-gate", type=float, default=0.01)
     parser.add_argument("--lambda-preserve", type=float, default=0.1)
+    parser.add_argument("--gate-beta", type=float, default=2.0)
+    parser.add_argument("--gate-gamma", type=float, default=1.0)
+    parser.add_argument("--gate-rho", type=float, default=0.05)
+    parser.add_argument("--preserve-consistency-threshold", type=float, default=0.90)
     parser.add_argument("--device", default=None)
     return parser.parse_args()
 
@@ -82,6 +86,10 @@ def main():
         lambda_boundary=args.lambda_boundary,
         lambda_gate=args.lambda_gate,
         lambda_preserve=args.lambda_preserve,
+        gate_beta=args.gate_beta,
+        gate_gamma=args.gate_gamma,
+        gate_rho=args.gate_rho,
+        preserve_consistency_threshold=args.preserve_consistency_threshold,
         random_seed=args.seed,
         verbose=True,
     )

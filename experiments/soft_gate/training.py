@@ -17,6 +17,7 @@ from tqdm import tqdm
 from experiments.soft_gate.model import AdaptiveEdgeGate, GatedSTAGATE
 
 Variant = Literal[
+    "baseline",
     "extra_training",
     "current_gate_only",
     "stabilized_unnormalized",
@@ -203,7 +204,7 @@ def build_gate_module(
     logit_clip: float,
     device: torch.device,
 ) -> AdaptiveEdgeGate | None:
-    if variant in {"extra_training", "uniform_gate"}:
+    if variant in {"baseline", "extra_training", "uniform_gate"}:
         return None
     centered = variant in {
         "stabilized_unnormalized",
@@ -265,7 +266,8 @@ def train_soft_gate_stagate(
         raise ValueError("rho must be in [0, 1)")
 
     variant = canonical_variant(variant)
-    renormalize_gate = variant_renormalizes(variant)
+    no_gate_mode = variant in {"baseline", "extra_training"} or gate_epochs == 0
+    renormalize_gate = False if no_gate_mode else variant_renormalizes(variant)
     set_seed(random_seed)
     adata.X = sp.csr_matrix(adata.X)
     training_data = build_training_data(adata, edge_priors, device)
@@ -322,7 +324,7 @@ def train_soft_gate_stagate(
             "Use --warmup-epochs > 0 to compute it inside this run."
         )
     warmup_tensor = torch.as_tensor(warmup_embedding, dtype=torch.float32, device=device)
-    gate_module = build_gate_module(
+    gate_module = None if no_gate_mode else build_gate_module(
         variant,
         warmup_tensor.shape[1],
         gate_dim,
@@ -361,7 +363,7 @@ def train_soft_gate_stagate(
             gate_module.train()
         optimizer.zero_grad()
 
-        if variant == "extra_training":
+        if no_gate_mode:
             edge_gate = torch.ones(
                 training_data.data.edge_index.shape[1],
                 dtype=torch.float32,
@@ -404,7 +406,7 @@ def train_soft_gate_stagate(
         )
         del latent
         reconstruction_loss = F.mse_loss(training_data.data.x, reconstructed)
-        if variant == "extra_training":
+        if no_gate_mode:
             budget_loss = torch.zeros((), dtype=torch.float32, device=device)
         else:
             budget_loss = (torch.mean(1.0 - pair_gate) - rho).pow(2)
@@ -437,7 +439,7 @@ def train_soft_gate_stagate(
     if gate_module is not None:
         gate_module.eval()
     with torch.no_grad():
-        if variant == "extra_training":
+        if no_gate_mode:
             final_edge_gate = torch.ones(
                 training_data.data.edge_index.shape[1],
                 dtype=torch.float32,

@@ -8,6 +8,7 @@ from typing import Any
 
 
 PRIMARY_VARIANTS = [
+    "baseline",
     "extra_training",
     "current_gate_only",
     "stabilized_unnormalized",
