@@ -249,8 +249,18 @@ def train_e3v3(
         "gate_max": float(final_gate.max().detach().cpu().item()),
     }
     if save_loss:
-        adata.uns[key_added + "_warmup_loss"] = warmup_losses
-        adata.uns[key_added + "_stage2_loss"] = stage2_losses
+        adata.uns[key_added + "_warmup_loss"] = np.asarray(warmup_losses, dtype=np.float32)
+        if stage2_losses:
+            loss_names = list(stage2_losses[0].keys())
+            loss_values = [
+                [loss_row[name] for name in loss_names]
+                for loss_row in stage2_losses
+            ]
+            adata.uns[key_added + "_stage2_loss_names"] = np.asarray(loss_names, dtype=str)
+            adata.uns[key_added + "_stage2_loss"] = np.asarray(loss_values, dtype=np.float32)
+        else:
+            adata.uns[key_added + "_stage2_loss_names"] = np.asarray([], dtype=str)
+            adata.uns[key_added + "_stage2_loss"] = np.empty((0, 0), dtype=np.float32)
     if save_reconstruction:
         reconstructed = out.detach().cpu().numpy()
         reconstructed[reconstructed < 0] = 0

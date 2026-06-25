@@ -62,7 +62,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--original-metrics", type=Path, default=None)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--latent-dim", type=int, default=30)
-    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Backward-compatible alias for --gate-epochs.",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=0,
+        help="Train an internal no-gate warm-up model for this many epochs. "
+        "If 0, use --warmup-key from the input h5ad.",
+    )
+    parser.add_argument(
+        "--gate-epochs",
+        type=int,
+        default=1000,
+        help="Number of post-warm-up ASG gate training epochs.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--gradient-clipping", type=float, default=5.0)
@@ -117,8 +135,12 @@ def default_original_metrics(sample_id: str) -> Path:
 def validate_args(args: argparse.Namespace) -> None:
     if args.gate_dim <= 0:
         raise ValueError("--gate-dim must be positive")
-    if args.epochs <= 0:
+    if args.epochs is not None and args.epochs <= 0:
         raise ValueError("--epochs must be positive")
+    if args.warmup_epochs < 0:
+        raise ValueError("--warmup-epochs must be non-negative")
+    if args.gate_epochs <= 0:
+        raise ValueError("--gate-epochs must be positive")
     if not 0.0 <= args.rho < 1.0:
         raise ValueError("--rho must be in [0, 1)")
     if not 0.0 <= args.g_min < 1.0:
@@ -155,7 +177,8 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
     print(f"Loading baseline artifact from {args.input_h5ad}")
     adata = sc.read_h5ad(args.input_h5ad)
     validate_baseline_adata(adata, args.ground_truth_key, "embedding")
-    warmup_embedding = validate_warmup_embedding(adata, args.warmup_key)
+    existing_warmup_embedding = validate_warmup_embedding(adata, args.warmup_key)
+    warmup_embedding = None if args.warmup_epochs > 0 else existing_warmup_embedding
     _, pairs = canonicalize_spatial_graph(adata.uns["Spatial_Net"], adata.obs_names)
 
     edge_prior_result = build_asg_edge_priors(
@@ -202,7 +225,8 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         warmup_embedding,
         variant=variant,
         hidden_dims=[args.hidden_dim, args.latent_dim],
-        n_epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+        gate_epochs=args.epochs if args.epochs is not None else args.gate_epochs,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
         gradient_clipping=args.gradient_clipping,
@@ -220,6 +244,10 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         logit_clip=args.logit_clip,
     )
     adata = training_result.adata
+
+    if args.warmup_epochs > 0:
+        adata.obsm[args.warmup_key] = training_result.warmup_embedding
+
 
     gate_score_columns = [
         "pair_id",
@@ -357,7 +385,9 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         "device": str(device),
         "seed": args.seed,
         "hidden_dims": [args.hidden_dim, args.latent_dim],
-        "epochs": args.epochs,
+        "warmup_epochs": args.warmup_epochs,
+        "gate_epochs": args.epochs if args.epochs is not None else args.gate_epochs,
+        "epochs": args.epochs if args.epochs is not None else args.gate_epochs,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "gate_dim": args.gate_dim,

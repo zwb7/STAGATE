@@ -46,12 +46,12 @@ the code falls back to a KMeans-distance softmax assignment.
 Run this only on the remote server according to the project protocol:
 
 ```bash
-python experiments/E3v3/run_dlpfc_e3v3.py \
+python experiments.E3v3.run_dlpfc_e3v3.py \
   --input-h5ad results/stagate/151674/151674_stagate.h5ad \
   --output-dir results/E3v3/151674 \
   --n-clusters 7 \
   --seed 0 \
-  --warmup-epochs 10 \
+  --warmup-epochs 500 \
   --stage2-epochs 500 \
   --rad-cutoff 150 \
   --truth-key GroundTruth \

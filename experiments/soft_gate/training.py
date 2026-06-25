@@ -44,6 +44,7 @@ class SoftGateTrainingData:
 @dataclass
 class SoftGateTrainingResult:
     adata: sc.AnnData
+    warmup_embedding: np.ndarray
     pair_gates: np.ndarray
     effective_degree: np.ndarray
     history: list[dict[str, float | int]]
@@ -232,11 +233,12 @@ def build_gate_module(
 def train_soft_gate_stagate(
     adata: sc.AnnData,
     edge_priors: pd.DataFrame,
-    warmup_embedding: np.ndarray,
+    warmup_embedding: np.ndarray | None,
     *,
     variant: Variant,
     hidden_dims: list[int],
-    n_epochs: int,
+    warmup_epochs: int,
+    gate_epochs: int,
     lr: float,
     weight_decay: float,
     gradient_clipping: float,
@@ -253,8 +255,10 @@ def train_soft_gate_stagate(
     temperature: float = 2.0,
     logit_clip: float = 5.0,
 ) -> SoftGateTrainingResult:
-    if n_epochs <= 0:
-        raise ValueError("n_epochs must be positive")
+    if warmup_epochs < 0:
+        raise ValueError("warmup_epochs must be non-negative")
+    if gate_epochs <= 0:
+        raise ValueError("gate_epochs must be positive")
     if len(hidden_dims) != 2:
         raise ValueError("hidden_dims must contain [hidden_dim, latent_dim]")
     if not 0.0 <= rho < 1.0:
@@ -269,6 +273,54 @@ def train_soft_gate_stagate(
         hidden_dims=[training_data.data.x.shape[1]] + hidden_dims
     ).to(device)
 
+    parameters: list[torch.nn.Parameter] = list(model.parameters())
+    warmup_history: list[dict[str, float | int | str]] = []
+    if warmup_epochs > 0:
+        warmup_optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        for epoch in tqdm(range(1, warmup_epochs + 1), desc="warm-up"):
+            model.train()
+            warmup_optimizer.zero_grad()
+            latent, reconstructed = model(
+                training_data.data.x,
+                training_data.data.edge_index,
+                edge_gate=None,
+                renormalize_gate=False,
+            )
+            del latent
+            reconstruction_loss = F.mse_loss(training_data.data.x, reconstructed)
+            reconstruction_loss.backward()
+            torch.nn.utils.clip_grad_norm_(parameters, gradient_clipping)
+            warmup_optimizer.step()
+            warmup_history.append(
+                {
+                    "stage": "warmup",
+                    "epoch": epoch,
+                    "total_loss": float(reconstruction_loss.detach().cpu()),
+                    "reconstruction_loss": float(reconstruction_loss.detach().cpu()),
+                    "budget_loss": 0.0,
+                    "mean_gate": 1.0,
+                    "std_gate": 0.0,
+                }
+            )
+        model.eval()
+        with torch.no_grad():
+            warmup_latent, _ = model(
+                training_data.data.x,
+                training_data.data.edge_index,
+                edge_gate=None,
+                renormalize_gate=False,
+            )
+        warmup_embedding = warmup_latent.detach().cpu().numpy()
+
+    if warmup_embedding is None:
+        raise ValueError(
+            "warmup_embedding is required when warmup_epochs is 0. "
+            "Use --warmup-epochs > 0 to compute it inside this run."
+        )
     warmup_tensor = torch.as_tensor(warmup_embedding, dtype=torch.float32, device=device)
     gate_module = build_gate_module(
         variant,
@@ -280,13 +332,12 @@ def train_soft_gate_stagate(
         logit_clip,
         device,
     )
-    parameters: list[torch.nn.Parameter] = list(model.parameters())
     if gate_module is not None:
         parameters.extend(gate_module.parameters())
 
     optimizer = torch.optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
-    history: list[dict[str, float | int]] = []
-    iterator = tqdm(range(1, n_epochs + 1))
+    history: list[dict[str, float | int | str]] = list(warmup_history)
+    iterator = tqdm(range(1, gate_epochs + 1), desc="gate")
     n_pairs = edge_priors.shape[0]
     non_self = ~training_data.edge_is_self_loop
     shuffle_permutation = torch.randperm(int(non_self.sum()), device=device)
@@ -358,6 +409,7 @@ def train_soft_gate_stagate(
         }
         history.append(
             {
+                "stage": "gate",
                 "epoch": epoch,
                 "total_loss": float(last_losses["total_loss"].cpu()),
                 "reconstruction_loss": float(
@@ -445,6 +497,7 @@ def train_soft_gate_stagate(
     final_losses = {key: float(value.cpu()) for key, value in last_losses.items()}
     return SoftGateTrainingResult(
         adata=adata,
+        warmup_embedding=warmup_embedding,
         pair_gates=final_pair_gate_np,
         effective_degree=effective_degree_np,
         history=history,
