@@ -1,0 +1,405 @@
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+from typing import Literal
+
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import scipy.sparse as sp
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+from torch_geometric.data import Data
+from tqdm import tqdm
+
+from experiments.soft_gate.model import EdgeGate, GatedSTAGATE
+
+Variant = Literal["extra_training", "gate_only", "gate_distribution", "full"]
+
+
+@dataclass
+class SoftGateTrainingData:
+    data: Data
+    edge_pair_id: Tensor
+    edge_is_self_loop: Tensor
+    pair_node_a: Tensor
+    pair_node_b: Tensor
+    pair_distribution_z: Tensor
+    pair_log_consistency: Tensor
+    preserve_mask: Tensor
+
+
+@dataclass
+class SoftGateTrainingResult:
+    adata: sc.AnnData
+    pair_gates: np.ndarray
+    effective_degree: np.ndarray
+    history: list[dict[str, float | int]]
+    final_losses: dict[str, float]
+    learned_beta: float | None
+    learned_eta: float | None
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _dense_expression(adata: sc.AnnData) -> np.ndarray:
+    if "highly_variable" in adata.var.columns:
+        adata_vars = adata[:, adata.var["highly_variable"]].copy()
+    else:
+        adata_vars = adata.copy()
+    matrix = adata_vars.X
+    if sp.issparse(matrix):
+        matrix = matrix.todense()
+    return np.asarray(matrix, dtype=np.float32)
+
+
+def build_training_data(
+    adata: sc.AnnData,
+    edge_priors: pd.DataFrame,
+    device: torch.device,
+) -> SoftGateTrainingData:
+    graph = adata.uns["Spatial_Net"].copy()
+    node_to_index = {str(node): index for index, node in enumerate(adata.obs_names)}
+    source = graph["Cell1"].astype(str).map(node_to_index)
+    target = graph["Cell2"].astype(str).map(node_to_index)
+    if source.isna().any() or target.isna().any():
+        raise ValueError("Spatial_Net contains spot IDs absent from adata.obs_names")
+
+    adjacency = sp.coo_matrix(
+        (
+            np.ones(graph.shape[0], dtype=np.float32),
+            (source.astype(int), target.astype(int)),
+        ),
+        shape=(adata.n_obs, adata.n_obs),
+    )
+    adjacency = adjacency + sp.eye(adata.n_obs, dtype=np.float32)
+    row, col = np.nonzero(adjacency)
+
+    pair_lookup: dict[tuple[int, int], int] = {}
+    for record in edge_priors.itertuples(index=False):
+        pair_lookup[
+            (
+                int(record.node_a_index),
+                int(record.node_b_index),
+            )
+        ] = int(record.pair_id)
+
+    edge_pair_id = np.full(row.shape[0], -1, dtype=np.int64)
+    edge_is_self_loop = row == col
+    for edge_position, (left, right) in enumerate(zip(row, col, strict=True)):
+        if left == right:
+            continue
+        key = (min(int(left), int(right)), max(int(left), int(right)))
+        if key not in pair_lookup:
+            raise ValueError(f"Spatial edge is absent from edge priors: {key}")
+        edge_pair_id[edge_position] = pair_lookup[key]
+
+    expression = _dense_expression(adata)
+    data = Data(
+        edge_index=torch.as_tensor(
+            np.vstack([row, col]),
+            dtype=torch.long,
+        ),
+        x=torch.as_tensor(expression, dtype=torch.float32),
+    ).to(device)
+
+    return SoftGateTrainingData(
+        data=data,
+        edge_pair_id=torch.as_tensor(edge_pair_id, dtype=torch.long, device=device),
+        edge_is_self_loop=torch.as_tensor(
+            edge_is_self_loop,
+            dtype=torch.bool,
+            device=device,
+        ),
+        pair_node_a=torch.as_tensor(
+            edge_priors["node_a_index"].to_numpy(dtype=np.int64),
+            dtype=torch.long,
+            device=device,
+        ),
+        pair_node_b=torch.as_tensor(
+            edge_priors["node_b_index"].to_numpy(dtype=np.int64),
+            dtype=torch.long,
+            device=device,
+        ),
+        pair_distribution_z=torch.as_tensor(
+            edge_priors["energy_distance_z"].to_numpy(dtype=np.float32),
+            dtype=torch.float32,
+            device=device,
+        ),
+        pair_log_consistency=torch.as_tensor(
+            edge_priors["log_soft_domain_consistency"].to_numpy(dtype=np.float32),
+            dtype=torch.float32,
+            device=device,
+        ),
+        preserve_mask=torch.as_tensor(
+            edge_priors["preserve_edge"].to_numpy(dtype=bool),
+            dtype=torch.bool,
+            device=device,
+        ),
+    )
+
+
+def effective_degree_from_pair_gates(
+    pair_gates: Tensor,
+    pair_node_a: Tensor,
+    pair_node_b: Tensor,
+    n_nodes: int,
+) -> Tensor:
+    degree = torch.zeros(
+        n_nodes,
+        dtype=pair_gates.dtype,
+        device=pair_gates.device,
+    )
+    degree.index_add_(0, pair_node_a, pair_gates)
+    degree.index_add_(0, pair_node_b, pair_gates)
+    return degree
+
+
+def _variant_flags(variant: Variant) -> tuple[bool, bool, bool]:
+    if variant == "extra_training":
+        return False, False, False
+    if variant == "gate_only":
+        return False, False, False
+    if variant == "gate_distribution":
+        return True, False, False
+    if variant == "full":
+        return True, True, True
+    raise ValueError(f"Unknown soft-gate variant: {variant}")
+
+
+def train_soft_gate_stagate(
+    adata: sc.AnnData,
+    edge_priors: pd.DataFrame,
+    warmup_embedding: np.ndarray,
+    *,
+    variant: Variant,
+    hidden_dims: list[int],
+    n_epochs: int,
+    lr: float,
+    weight_decay: float,
+    gradient_clipping: float,
+    gate_dim: int,
+    rho: float,
+    minimum_effective_degree: float,
+    lambda_budget: float,
+    lambda_degree: float,
+    lambda_preserve: float,
+    key_added: str,
+    random_seed: int,
+    save_loss: bool,
+    save_reconstruction: bool,
+    device: torch.device,
+) -> SoftGateTrainingResult:
+    if n_epochs <= 0:
+        raise ValueError("n_epochs must be positive")
+    if len(hidden_dims) != 2:
+        raise ValueError("hidden_dims must contain [hidden_dim, latent_dim]")
+    if not 0.0 <= rho < 1.0:
+        raise ValueError("rho must be in [0, 1)")
+
+    set_seed(random_seed)
+    adata.X = sp.csr_matrix(adata.X)
+    training_data = build_training_data(adata, edge_priors, device)
+    model = GatedSTAGATE(
+        hidden_dims=[training_data.data.x.shape[1]] + hidden_dims
+    ).to(device)
+
+    use_distribution, use_consistency, use_preserve = _variant_flags(variant)
+    gate_module: EdgeGate | None = None
+    parameters: list[torch.nn.Parameter] = list(model.parameters())
+    warmup_tensor = torch.as_tensor(
+        warmup_embedding,
+        dtype=torch.float32,
+        device=device,
+    )
+    if variant != "extra_training":
+        gate_module = EdgeGate(
+            warmup_tensor.shape[1],
+            gate_dim,
+            use_distribution=use_distribution,
+            use_consistency=use_consistency,
+        ).to(device)
+        parameters.extend(gate_module.parameters())
+
+    optimizer = torch.optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
+    history: list[dict[str, float | int]] = []
+    iterator = tqdm(range(1, n_epochs + 1))
+
+    last_losses: dict[str, Tensor] = {}
+    for epoch in iterator:
+        model.train()
+        if gate_module is not None:
+            gate_module.train()
+        optimizer.zero_grad()
+
+        if gate_module is None:
+            edge_gate = torch.ones(
+                training_data.data.edge_index.shape[1],
+                dtype=torch.float32,
+                device=device,
+            )
+            pair_gate = torch.ones(
+                edge_priors.shape[0],
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            edge_gate = gate_module.edge_gates(
+                warmup_tensor,
+                training_data.data.edge_index,
+                training_data.edge_pair_id,
+                training_data.edge_is_self_loop,
+                training_data.pair_distribution_z,
+                training_data.pair_log_consistency,
+            )
+            pair_gate = gate_module.pair_gates(
+                warmup_tensor,
+                training_data.pair_node_a,
+                training_data.pair_node_b,
+                training_data.pair_distribution_z,
+                training_data.pair_log_consistency,
+            )
+
+        z, reconstructed = model(
+            training_data.data.x,
+            training_data.data.edge_index,
+            edge_gate=edge_gate,
+        )
+        del z
+        reconstruction_loss = F.mse_loss(training_data.data.x, reconstructed)
+        budget_loss = torch.zeros((), dtype=torch.float32, device=device)
+        degree_loss = torch.zeros((), dtype=torch.float32, device=device)
+        preserve_loss = torch.zeros((), dtype=torch.float32, device=device)
+
+        if gate_module is not None:
+            budget_loss = (torch.mean(1.0 - pair_gate) - rho).pow(2)
+            effective_degree = effective_degree_from_pair_gates(
+                pair_gate,
+                training_data.pair_node_a,
+                training_data.pair_node_b,
+                adata.n_obs,
+            )
+            degree_loss = F.relu(minimum_effective_degree - effective_degree).pow(
+                2
+            ).mean()
+            if use_preserve and bool(training_data.preserve_mask.any()):
+                preserve_loss = (1.0 - pair_gate[training_data.preserve_mask]).pow(
+                    2
+                ).mean()
+
+        total_loss = (
+            reconstruction_loss
+            + lambda_budget * budget_loss
+            + lambda_degree * degree_loss
+            + lambda_preserve * preserve_loss
+        )
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(parameters, gradient_clipping)
+        optimizer.step()
+
+        last_losses = {
+            "total_loss": total_loss.detach(),
+            "reconstruction_loss": reconstruction_loss.detach(),
+            "budget_loss": budget_loss.detach(),
+            "degree_loss": degree_loss.detach(),
+            "preserve_loss": preserve_loss.detach(),
+        }
+        history.append(
+            {
+                "epoch": epoch,
+                "total_loss": float(last_losses["total_loss"].cpu()),
+                "reconstruction_loss": float(
+                    last_losses["reconstruction_loss"].cpu()
+                ),
+                "budget_loss": float(last_losses["budget_loss"].cpu()),
+                "degree_loss": float(last_losses["degree_loss"].cpu()),
+                "preserve_loss": float(last_losses["preserve_loss"].cpu()),
+            }
+        )
+
+    model.eval()
+    if gate_module is not None:
+        gate_module.eval()
+    with torch.no_grad():
+        if gate_module is None:
+            final_edge_gate = torch.ones(
+                training_data.data.edge_index.shape[1],
+                dtype=torch.float32,
+                device=device,
+            )
+            final_pair_gate = torch.ones(
+                edge_priors.shape[0],
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            final_edge_gate = gate_module.edge_gates(
+                warmup_tensor,
+                training_data.data.edge_index,
+                training_data.edge_pair_id,
+                training_data.edge_is_self_loop,
+                training_data.pair_distribution_z,
+                training_data.pair_log_consistency,
+            )
+            final_pair_gate = gate_module.pair_gates(
+                warmup_tensor,
+                training_data.pair_node_a,
+                training_data.pair_node_b,
+                training_data.pair_distribution_z,
+                training_data.pair_log_consistency,
+            )
+        latent, reconstructed = model(
+            training_data.data.x,
+            training_data.data.edge_index,
+            edge_gate=final_edge_gate,
+        )
+        del reconstructed
+        effective_degree = effective_degree_from_pair_gates(
+            final_pair_gate,
+            training_data.pair_node_a,
+            training_data.pair_node_b,
+            adata.n_obs,
+        )
+
+    adata.obsm[key_added] = latent.detach().cpu().numpy()
+    final_pair_gate_np = final_pair_gate.detach().cpu().numpy()
+    effective_degree_np = effective_degree.detach().cpu().numpy()
+    if save_loss:
+        adata.uns["STAGATE_loss"] = float(
+            last_losses.get("reconstruction_loss", torch.tensor(float("nan"))).cpu()
+        )
+    if save_reconstruction:
+        with torch.no_grad():
+            _, final_reconstruction = model(
+                training_data.data.x,
+                training_data.data.edge_index,
+                edge_gate=final_edge_gate,
+            )
+        reconstruction = final_reconstruction.detach().cpu().numpy()
+        reconstruction[reconstruction < 0] = 0
+        adata.layers["STAGATE_ReX"] = reconstruction
+
+    final_losses = {
+        key: float(value.cpu())
+        for key, value in last_losses.items()
+    }
+    return SoftGateTrainingResult(
+        adata=adata,
+        pair_gates=final_pair_gate_np,
+        effective_degree=effective_degree_np,
+        history=history,
+        final_losses=final_losses,
+        learned_beta=(
+            float(gate_module.beta.detach().cpu()) if gate_module is not None else None
+        ),
+        learned_eta=(
+            float(gate_module.eta.detach().cpu()) if gate_module is not None else None
+        ),
+    )
