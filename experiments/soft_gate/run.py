@@ -11,7 +11,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import scanpy as sc
 import torch
 from sklearn.metrics import adjusted_rand_score
@@ -25,26 +24,36 @@ from examples.rule_based_graph_refinement import (
     validate_baseline_adata,
 )
 from experiments.soft_gate.diagnostics import gate_diagnostics
-from experiments.soft_gate.features import build_edge_priors, validate_warmup_embedding
-from experiments.soft_gate.training import Variant, train_soft_gate_stagate
+from experiments.soft_gate.features import build_asg_edge_priors, validate_warmup_embedding
+from experiments.soft_gate.training import canonical_variant, train_soft_gate_stagate
+
+VARIANTS = [
+    "extra_training",
+    "current_gate_only",
+    "stabilized_unnormalized",
+    "stabilized_renormalized",
+    "uniform_gate",
+    "shuffled_gate",
+    "boundary_focused",
+    # Backward-compatible aliases from the abandoned E3-v1 command set.
+    "gate_only",
+    "gate_distribution",
+    "full",
+]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run E3 soft gated graph refinement for STAGATE."
+        description="Run E3-v2 Adaptive Soft Edge Gating for STAGATE."
     )
     parser.add_argument("--input-h5ad", type=Path, required=True)
     parser.add_argument("--sample-id", required=True)
     parser.add_argument("--clusters", type=int, required=True)
-    parser.add_argument(
-        "--variant",
-        choices=["extra_training", "gate_only", "gate_distribution", "full"],
-        required=True,
-    )
+    parser.add_argument("--variant", choices=VARIANTS, required=True)
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/soft_gate"),
+        default=Path("results/soft_gate_v2"),
         help="Results are saved under <output-dir>/<variant>/<sample-id>/.",
     )
     parser.add_argument("--ground-truth-key", default="Ground Truth")
@@ -59,12 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-clipping", type=float, default=5.0)
     parser.add_argument("--gate-dim", type=int, default=16)
     parser.add_argument("--rho", type=float, default=0.05)
-    parser.add_argument("--minimum-effective-degree", type=float, default=3.0)
     parser.add_argument("--lambda-budget", type=float, default=1.0)
-    parser.add_argument("--lambda-degree", type=float, default=1.0)
-    parser.add_argument("--lambda-preserve", type=float, default=1.0)
-    parser.add_argument("--preserve-c-quantile", type=float, default=0.75)
-    parser.add_argument("--preserve-z-quantile", type=float, default=0.70)
+    parser.add_argument("--g-min", type=float, default=0.80)
+    parser.add_argument("--initial-mean-gate", type=float, default=0.95)
+    parser.add_argument("--temperature", type=float, default=2.0)
+    parser.add_argument("--logit-clip", type=float, default=5.0)
+    parser.add_argument("--boundary-candidate-quantile", type=float, default=0.30)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda:7")
     parser.add_argument("--r-home", default=None)
@@ -112,8 +121,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--epochs must be positive")
     if not 0.0 <= args.rho < 1.0:
         raise ValueError("--rho must be in [0, 1)")
-    if args.minimum_effective_degree < 0:
-        raise ValueError("--minimum-effective-degree must be non-negative")
+    if not 0.0 <= args.g_min < 1.0:
+        raise ValueError("--g-min must be in [0, 1)")
+    if not args.g_min < args.initial_mean_gate < 1.0:
+        raise ValueError("--initial-mean-gate must be in (g_min, 1)")
+    if args.temperature <= 0:
+        raise ValueError("--temperature must be positive")
+    if args.logit_clip <= 0:
+        raise ValueError("--logit-clip must be positive")
+    if not 0.0 < args.boundary_candidate_quantile < 1.0:
+        raise ValueError("--boundary-candidate-quantile must be in (0, 1)")
 
 
 def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
@@ -126,7 +143,9 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
     if not args.input_h5ad.exists():
         raise FileNotFoundError(f"Baseline h5ad not found: {args.input_h5ad}")
 
-    output_dir = args.output_dir / args.variant / args.sample_id
+    requested_variant = args.variant
+    variant = canonical_variant(args.variant)
+    output_dir = args.output_dir / variant / args.sample_id
     if output_dir.exists() and any(output_dir.iterdir()) and not args.overwrite:
         raise FileExistsError(
             f"Output directory is not empty: {output_dir}. Use --overwrite."
@@ -139,14 +158,13 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
     warmup_embedding = validate_warmup_embedding(adata, args.warmup_key)
     _, pairs = canonicalize_spatial_graph(adata.uns["Spatial_Net"], adata.obs_names)
 
-    edge_prior_result = build_edge_priors(
+    edge_prior_result = build_asg_edge_priors(
         adata,
         pairs,
         clusters=args.clusters,
         seed=args.seed,
         embedding_key=args.warmup_key,
-        preserve_c_quantile=args.preserve_c_quantile,
-        preserve_z_quantile=args.preserve_z_quantile,
+        boundary_candidate_quantile=args.boundary_candidate_quantile,
     )
     edge_priors = edge_prior_result.table
     edge_priors.to_csv(output_dir / "edge_priors.csv", index=False)
@@ -159,24 +177,17 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
     with (output_dir / "graph_metrics.json").open("w", encoding="utf-8") as file:
         json.dump(
             {
-                "method": "soft_gated_graph_refinement",
-                "variant": args.variant,
+                "method": "asg_stagate",
+                "variant": variant,
+                "requested_variant": requested_variant,
                 "hard_pruning": False,
-                "original_directed_edge_count": original_graph_stats[
-                    "n_directed_edges"
-                ],
-                "original_undirected_edge_count": original_graph_stats[
-                    "n_undirected_edges"
-                ],
-                "original_isolated_node_count": original_graph_stats[
-                    "isolated_node_count"
-                ],
-                "original_connected_component_count": original_graph_stats[
-                    "connected_component_count"
-                ],
-                "original_largest_component_ratio": original_graph_stats[
-                    "largest_component_ratio"
-                ],
+                "boundary_candidate_threshold": edge_prior_result.boundary_candidate_threshold,
+                "n_boundary_candidate_edges": int(edge_priors["boundary_candidate"].sum()),
+                "original_directed_edge_count": original_graph_stats["n_directed_edges"],
+                "original_undirected_edge_count": original_graph_stats["n_undirected_edges"],
+                "original_isolated_node_count": original_graph_stats["isolated_node_count"],
+                "original_connected_component_count": original_graph_stats["connected_component_count"],
+                "original_largest_component_ratio": original_graph_stats["largest_component_ratio"],
             },
             file,
             indent=2,
@@ -189,7 +200,7 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         adata,
         edge_priors,
         warmup_embedding,
-        variant=args.variant,
+        variant=variant,
         hidden_dims=[args.hidden_dim, args.latent_dim],
         n_epochs=args.epochs,
         lr=args.learning_rate,
@@ -197,34 +208,33 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         gradient_clipping=args.gradient_clipping,
         gate_dim=args.gate_dim,
         rho=args.rho,
-        minimum_effective_degree=args.minimum_effective_degree,
         lambda_budget=args.lambda_budget,
-        lambda_degree=args.lambda_degree,
-        lambda_preserve=args.lambda_preserve,
         key_added="STAGATE",
         random_seed=args.seed,
         save_loss=True,
         save_reconstruction=False,
         device=device,
+        g_min=args.g_min,
+        initial_mean_gate=args.initial_mean_gate,
+        temperature=args.temperature,
+        logit_clip=args.logit_clip,
     )
     adata = training_result.adata
 
-    gate_scores = edge_priors.loc[
-        :,
-        [
-            "pair_id",
-            "node_a",
-            "node_b",
-            "node_a_index",
-            "node_b_index",
-            "distance",
-            "soft_domain_consistency",
-            "embedding_similarity",
-            "energy_distance",
-            "energy_distance_z",
-            "preserve_edge",
-        ],
-    ].copy()
+    gate_score_columns = [
+        "pair_id",
+        "node_a",
+        "node_b",
+        "node_a_index",
+        "node_b_index",
+        "distance",
+        "soft_domain_consistency",
+        "embedding_similarity",
+        "node_a_entropy",
+        "node_b_entropy",
+        "boundary_candidate",
+    ]
+    gate_scores = edge_priors.loc[:, gate_score_columns].copy()
     gate_scores["gate"] = training_result.pair_gates
     gate_scores.to_csv(output_dir / "gate_scores.csv", index=False)
 
@@ -235,19 +245,12 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         training_result.effective_degree,
         ground_truth_key=args.ground_truth_key,
     )
-    diagnostics["preserve_c_threshold"] = edge_prior_result.preserve_c_threshold
-    diagnostics["preserve_z_threshold"] = edge_prior_result.preserve_z_threshold
-    diagnostics["n_preserve_edges"] = int(edge_priors["preserve_edge"].sum())
-    with (output_dir / "gate_diagnostics.json").open(
-        "w",
-        encoding="utf-8",
-    ) as file:
+    diagnostics["boundary_candidate_threshold"] = edge_prior_result.boundary_candidate_threshold
+    diagnostics["n_boundary_candidate_edges"] = int(edge_priors["boundary_candidate"].sum())
+    with (output_dir / "gate_diagnostics.json").open("w", encoding="utf-8") as file:
         json.dump(diagnostics, file, indent=2, ensure_ascii=False)
 
-    with (output_dir / "training_history.json").open(
-        "w",
-        encoding="utf-8",
-    ) as file:
+    with (output_dir / "training_history.json").open("w", encoding="utf-8") as file:
         json.dump(training_result.history, file, indent=2, ensure_ascii=False)
 
     sc.pp.neighbors(adata, use_rep="STAGATE", random_state=args.seed)
@@ -284,10 +287,7 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         sc.pl.umap(
             adata,
             color=["mclust", args.ground_truth_key],
-            title=[
-                f"Soft gate {args.variant} (ARI={ari:.2f})",
-                "Ground Truth",
-            ],
+            title=[f"ASG {variant} (ARI={ari:.2f})", "Ground Truth"],
             show=False,
         )
         save_current_figure(output_dir / "umap_clusters.png")
@@ -295,10 +295,7 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
             adata,
             img_key="hires",
             color=["mclust", args.ground_truth_key],
-            title=[
-                f"Soft gate {args.variant} (ARI={ari:.2f})",
-                "Ground Truth",
-            ],
+            title=[f"ASG {variant} (ARI={ari:.2f})", "Ground Truth"],
             show=False,
         )
         save_current_figure(output_dir / "spatial_clusters.png")
@@ -306,10 +303,12 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
     gate_summary = diagnostics["gate_summary"]
     result = {
         "sample_id": args.sample_id,
-        "method": f"soft_gate_{args.variant}",
-        "variant": args.variant,
+        "method": "asg_stagate",
+        "variant": variant,
+        "requested_variant": requested_variant,
         "uses_ground_truth_for_refinement": False,
         "hard_pruning": False,
+        "renormalize_gate": training_result.renormalize_gate,
         "input_h5ad": str(args.input_h5ad),
         "ground_truth_key": args.ground_truth_key,
         "n_spots": int(adata.n_obs),
@@ -319,43 +318,42 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         "baseline_ari": baseline_ari,
         "baseline_metrics": baseline_metrics_path,
         "original_reencoding_ari": original_ari,
-        "original_metrics": (
-            str(original_metrics_path) if original_metrics_path.exists() else None
-        ),
+        "original_metrics": str(original_metrics_path) if original_metrics_path.exists() else None,
         "ari": float(ari),
         "soft_gate_ari": float(ari),
-        "delta_vs_baseline": (
-            float(ari - baseline_ari) if baseline_ari is not None else None
-        ),
-        "delta_vs_original": (
-            float(ari - original_ari) if original_ari is not None else None
-        ),
+        "delta_vs_baseline": float(ari - baseline_ari) if baseline_ari is not None else None,
+        "delta_vs_original": float(ari - original_ari) if original_ari is not None else None,
         "mean_gate": gate_summary["mean_gate"],
         "std_gate": gate_summary["std_gate"],
         "minimum_gate": gate_summary["minimum_gate"],
         "maximum_gate": gate_summary["maximum_gate"],
+        "gate_p1": gate_summary["gate_p1"],
+        "gate_p5": gate_summary["gate_p5"],
+        "gate_p10": gate_summary["gate_p10"],
+        "gate_p50": gate_summary["gate_p50"],
+        "gate_p90": gate_summary["gate_p90"],
+        "gate_p95": gate_summary["gate_p95"],
+        "gate_p99": gate_summary["gate_p99"],
         "mean_effective_degree": gate_summary["mean_effective_degree"],
         "minimum_effective_degree": gate_summary["minimum_effective_degree"],
         "maximum_effective_degree": gate_summary["maximum_effective_degree"],
-        "learned_beta": training_result.learned_beta,
-        "learned_eta": training_result.learned_eta,
-        "preserve_c_quantile": args.preserve_c_quantile,
-        "preserve_z_quantile": args.preserve_z_quantile,
-        "preserve_c_threshold": edge_prior_result.preserve_c_threshold,
-        "preserve_z_threshold": edge_prior_result.preserve_z_threshold,
-        "n_preserve_edges": int(edge_priors["preserve_edge"].sum()),
+        "effective_degree_p1": gate_summary["effective_degree_p1"],
+        "effective_degree_p5": gate_summary["effective_degree_p5"],
+        "effective_degree_p50": gate_summary["effective_degree_p50"],
+        "effective_degree_p95": gate_summary["effective_degree_p95"],
+        "learned_bias": training_result.learned_bias,
         "rho": args.rho,
-        "minimum_effective_degree_target": args.minimum_effective_degree,
         "lambda_budget": args.lambda_budget,
-        "lambda_degree": args.lambda_degree,
-        "lambda_preserve": args.lambda_preserve,
+        "g_min": args.g_min,
+        "initial_mean_gate": args.initial_mean_gate,
+        "temperature": args.temperature,
+        "logit_clip": args.logit_clip,
+        "boundary_candidate_quantile": args.boundary_candidate_quantile,
+        "boundary_candidate_threshold": edge_prior_result.boundary_candidate_threshold,
+        "n_boundary_candidate_edges": int(edge_priors["boundary_candidate"].sum()),
         "final_total_loss": training_result.final_losses.get("total_loss"),
-        "final_reconstruction_loss": training_result.final_losses.get(
-            "reconstruction_loss"
-        ),
+        "final_reconstruction_loss": training_result.final_losses.get("reconstruction_loss"),
         "final_budget_loss": training_result.final_losses.get("budget_loss"),
-        "final_degree_loss": training_result.final_losses.get("degree_loss"),
-        "final_preserve_loss": training_result.final_losses.get("preserve_loss"),
         "device": str(device),
         "seed": args.seed,
         "hidden_dims": [args.hidden_dim, args.latent_dim],
@@ -365,7 +363,7 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         "gate_dim": args.gate_dim,
     }
 
-    output_h5ad = output_dir / f"{args.sample_id}_soft_gate_{args.variant}_stagate.h5ad"
+    output_h5ad = output_dir / f"{args.sample_id}_asg_{variant}_stagate.h5ad"
     adata.write_h5ad(output_h5ad)
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as file:
         json.dump(result, file, indent=2, ensure_ascii=False)

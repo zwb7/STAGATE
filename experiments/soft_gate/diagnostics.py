@@ -17,10 +17,24 @@ def _edge_truth(
     left = labels.iloc[node_a]
     right = labels.iloc[node_b]
     valid = left.notna().to_numpy() & right.notna().to_numpy()
-    cross_domain = (
-        left.astype(str).to_numpy() != right.astype(str).to_numpy()
-    )
+    cross_domain = left.astype(str).to_numpy() != right.astype(str).to_numpy()
     return valid, cross_domain
+
+
+def _quantiles(prefix: str, values: np.ndarray) -> dict[str, float]:
+    quantile_map = {
+        "p1": 0.01,
+        "p5": 0.05,
+        "p10": 0.10,
+        "p50": 0.50,
+        "p90": 0.90,
+        "p95": 0.95,
+        "p99": 0.99,
+    }
+    return {
+        f"{prefix}_{name}": float(np.quantile(values, quantile))
+        for name, quantile in quantile_map.items()
+    }
 
 
 def summarize_gates(
@@ -33,7 +47,7 @@ def summarize_gates(
             "pair_gates length does not match pairs: "
             f"{pair_gates.shape[0]} vs {pairs.shape[0]}"
         )
-    return {
+    summary = {
         "mean_gate": float(np.mean(pair_gates)),
         "std_gate": float(np.std(pair_gates)),
         "minimum_gate": float(np.min(pair_gates)),
@@ -42,6 +56,9 @@ def summarize_gates(
         "minimum_effective_degree": float(np.min(effective_degree)),
         "maximum_effective_degree": float(np.max(effective_degree)),
     }
+    summary.update(_quantiles("gate", pair_gates))
+    summary.update(_quantiles("effective_degree", effective_degree))
+    return summary
 
 
 def gate_diagnostics(
@@ -100,16 +117,8 @@ def gate_diagnostics(
             if low_precision is not None and original_cross_ratio > 0
             else None
         )
-        low_cdr = (
-            float(low_cross_count / cross_total)
-            if cross_total > 0
-            else None
-        )
-        low_sdr = (
-            float(low_same_count / same_total)
-            if same_total > 0
-            else None
-        )
+        low_cdr = float(low_cross_count / cross_total) if cross_total > 0 else None
+        low_sdr = float(low_same_count / same_total) if same_total > 0 else None
         low_gate_report[f"bottom_{int(round(quantile * 100))}pct"] = {
             "quantile": quantile,
             "gate_cutoff": cutoff,

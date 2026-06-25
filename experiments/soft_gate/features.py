@@ -179,3 +179,61 @@ def build_edge_priors(
         preserve_c_threshold=c_threshold,
         preserve_z_threshold=z_threshold,
     )
+
+
+@dataclass
+class ASGEdgePriorResult:
+    table: pd.DataFrame
+    soft_assignments: np.ndarray
+    boundary_candidate_threshold: float
+
+
+def assignment_entropy(probabilities: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    clipped = np.clip(probabilities, eps, 1.0)
+    return -np.sum(clipped * np.log(clipped), axis=1)
+
+
+def build_asg_edge_priors(
+    adata: sc.AnnData,
+    pairs: pd.DataFrame,
+    *,
+    clusters: int,
+    seed: int,
+    embedding_key: str = "STAGATE",
+    boundary_candidate_quantile: float = 0.30,
+    eps: float = 1e-8,
+) -> ASGEdgePriorResult:
+    """Build E3-v2 priors without distribution distance.
+
+    E3-v2 intentionally removes energy/MMD/OT distribution priors. The returned
+    table contains only warm-up soft-domain consistency and diagnostics needed
+    for ASG-STAGATE and optional boundary-focused gating.
+    """
+    if not 0.0 < boundary_candidate_quantile < 1.0:
+        raise ValueError("boundary_candidate_quantile must be in (0, 1)")
+
+    embedding = validate_warmup_embedding(adata, embedding_key)
+    soft_assignments = fit_soft_assignments(embedding, clusters, seed)
+    node_a = pairs["node_a_index"].to_numpy(dtype=int)
+    node_b = pairs["node_b_index"].to_numpy(dtype=int)
+
+    consistency = np.einsum(
+        "ij,ij->i",
+        soft_assignments[node_a],
+        soft_assignments[node_b],
+    )
+    consistency = np.clip(consistency, eps, 1.0)
+    threshold = float(np.quantile(consistency, boundary_candidate_quantile))
+    entropy = assignment_entropy(soft_assignments, eps=eps)
+
+    table = pairs.copy()
+    table["soft_domain_consistency"] = consistency
+    table["embedding_similarity"] = cosine_pair_similarity(embedding, pairs)
+    table["node_a_entropy"] = entropy[node_a]
+    table["node_b_entropy"] = entropy[node_b]
+    table["boundary_candidate"] = consistency <= threshold
+    return ASGEdgePriorResult(
+        table=table,
+        soft_assignments=soft_assignments,
+        boundary_candidate_threshold=threshold,
+    )

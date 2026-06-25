@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple, Union
 
 import torch
@@ -7,19 +8,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn import Parameter
 from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.typing import Adj, NoneType, OptPairTensor, OptTensor, Size
+from torch_geometric.typing import Adj, OptPairTensor, OptTensor, Size
 from torch_geometric.utils import add_self_loops, remove_self_loops, softmax
 from torch_sparse import SparseTensor, set_diag
 
 
 class GatedGATConv(MessagePassing):
-    """A baseline-faithful copy of STAGATE's GATConv with optional edge gates.
-
-    The official ``STAGATE_pyG.gat_conv.GATConv`` is intentionally not modified.
-    This layer keeps the same parameterization and attention computation, then
-    multiplies normalized attention by a continuous edge gate during message
-    passing.
-    """
+    """A baseline-faithful copy of STAGATE's GATConv with optional edge gates."""
 
     _alpha: OptTensor
 
@@ -64,6 +59,7 @@ class GatedGATConv(MessagePassing):
         x: Union[Tensor, OptPairTensor],
         edge_index: Adj,
         edge_gate: OptTensor = None,
+        renormalize_gate: bool = False,
         size: Size = None,
         return_attention_weights=None,
         attention: bool = True,
@@ -122,6 +118,7 @@ class GatedGATConv(MessagePassing):
             x=x_pair,
             alpha=alpha,
             edge_gate=edge_gate,
+            renormalize_gate=renormalize_gate,
             size=size,
         )
 
@@ -148,6 +145,7 @@ class GatedGATConv(MessagePassing):
         alpha_j: Tensor,
         alpha_i: OptTensor,
         edge_gate: OptTensor,
+        renormalize_gate: bool,
         index: Tensor,
         ptr: OptTensor,
         size_i: Optional[int],
@@ -155,55 +153,109 @@ class GatedGATConv(MessagePassing):
         alpha = alpha_j if alpha_i is None else alpha_j + alpha_i
         alpha = torch.sigmoid(alpha)
         alpha = softmax(alpha, index, ptr, size_i)
-        self._alpha = alpha
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
         if edge_gate is not None:
             alpha = alpha * edge_gate.view(-1, 1)
+            if renormalize_gate:
+                n_targets = size_i
+                if n_targets is None:
+                    n_targets = int(index.max().detach().cpu()) + 1
+                denominator = torch.zeros(
+                    (n_targets, alpha.shape[1]),
+                    dtype=alpha.dtype,
+                    device=alpha.device,
+                )
+                denominator.index_add_(0, index, alpha)
+                alpha = alpha / (denominator[index] + 1e-8)
+        self._alpha = alpha
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
         return x_j * alpha.unsqueeze(-1)
 
 
-class EdgeGate(nn.Module):
+class AdaptiveEdgeGate(nn.Module):
+    """E3-v2 adaptive soft edge gate.
+
+    ``u_ij = (Wq z_i)^T(Wk z_j) / sqrt(d)``, where ``i`` is the
+    receiving/center node and ``j`` is the source neighbor. Stabilized variants
+    center logits within each center node's neighborhood and use a bounded gate
+    with lower bound ``g_min``.
+    """
+
     def __init__(
         self,
         embedding_dim: int,
         gate_dim: int,
         *,
-        use_distribution: bool,
-        use_consistency: bool,
+        centered: bool,
+        bounded: bool,
+        g_min: float,
+        initial_mean_gate: float,
+        temperature: float,
+        logit_clip: float,
+        boundary_focused: bool = False,
     ) -> None:
         super().__init__()
+        if gate_dim <= 0:
+            raise ValueError("gate_dim must be positive")
+        if not 0.0 <= g_min < 1.0:
+            raise ValueError("g_min must be in [0, 1)")
+        if not g_min < initial_mean_gate < 1.0:
+            raise ValueError("initial_mean_gate must be in (g_min, 1)")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        if logit_clip <= 0:
+            raise ValueError("logit_clip must be positive")
+
         self.query = nn.Linear(embedding_dim, gate_dim, bias=False)
         self.key = nn.Linear(embedding_dim, gate_dim, bias=False)
-        self.raw_beta = nn.Parameter(torch.tensor(0.0))
-        self.raw_eta = nn.Parameter(torch.tensor(0.0))
-        self.use_distribution = use_distribution
-        self.use_consistency = use_consistency
+        self.centered = centered
+        self.bounded = bounded
+        self.g_min = float(g_min)
+        self.temperature = float(temperature)
+        self.logit_clip = float(logit_clip)
+        self.boundary_focused = boundary_focused
         self.scale = gate_dim**0.5
 
-    @property
-    def beta(self) -> Tensor:
-        return F.softplus(self.raw_beta)
-
-    @property
-    def eta(self) -> Tensor:
-        return F.softplus(self.raw_eta)
+        normalized_initial = (initial_mean_gate - g_min) / (1.0 - g_min)
+        normalized_initial = min(max(normalized_initial, 1e-6), 1.0 - 1e-6)
+        initial_bias = temperature * math.log(
+            normalized_initial / (1.0 - normalized_initial)
+        )
+        self.bias = nn.Parameter(torch.tensor(float(initial_bias)))
 
     def _directed_logits(
         self,
         warmup_embedding: Tensor,
-        source: Tensor,
-        target: Tensor,
-        distribution_z: Tensor,
-        log_consistency: Tensor,
-    ) -> Tensor:
+        edge_index: Tensor,
+        edge_is_self_loop: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        source = edge_index[0]
+        center = edge_index[1]
+        non_self = ~edge_is_self_loop
         query = self.query(warmup_embedding)
         key = self.key(warmup_embedding)
-        logits = (query[source] * key[target]).sum(dim=1) / self.scale
-        if self.use_distribution:
-            logits = logits - self.beta * distribution_z
-        if self.use_consistency:
-            logits = logits + self.eta * log_consistency
-        return logits
+        logits = (query[center[non_self]] * key[source[non_self]]).sum(dim=1)
+        logits = logits / self.scale
+        return logits, center[non_self], non_self
+
+    def _center_logits(
+        self,
+        logits: Tensor,
+        center: Tensor,
+        n_nodes: int,
+    ) -> Tensor:
+        count = torch.zeros(n_nodes, dtype=logits.dtype, device=logits.device)
+        count.index_add_(0, center, torch.ones_like(logits))
+        count = count.clamp_min(1.0)
+
+        mean = torch.zeros(n_nodes, dtype=logits.dtype, device=logits.device)
+        mean.index_add_(0, center, logits)
+        mean = mean / count
+
+        centered = logits - mean[center]
+        variance = torch.zeros(n_nodes, dtype=logits.dtype, device=logits.device)
+        variance.index_add_(0, center, centered.pow(2))
+        std = torch.sqrt(variance / count + 1e-8)
+        return centered / (std[center] + 1e-8)
 
     def edge_gates(
         self,
@@ -211,51 +263,39 @@ class EdgeGate(nn.Module):
         edge_index: Tensor,
         edge_pair_id: Tensor,
         edge_is_self_loop: Tensor,
-        pair_distribution_z: Tensor,
-        pair_log_consistency: Tensor,
+        pair_boundary_candidate: Tensor,
     ) -> Tensor:
-        source = edge_index[0]
-        target = edge_index[1]
         gates = torch.ones(
             edge_index.shape[1],
             dtype=warmup_embedding.dtype,
             device=warmup_embedding.device,
         )
-        non_self = ~edge_is_self_loop
-        pair_id = edge_pair_id[non_self]
-        logits = self._directed_logits(
+        logits, center, non_self = self._directed_logits(
             warmup_embedding,
-            source[non_self],
-            target[non_self],
-            pair_distribution_z[pair_id],
-            pair_log_consistency[pair_id],
+            edge_index,
+            edge_is_self_loop,
         )
-        gates[non_self] = torch.sigmoid(logits)
-        return gates
+        if self.centered:
+            logits = self._center_logits(logits, center, warmup_embedding.shape[0])
+        logits = torch.clamp(logits, -self.logit_clip, self.logit_clip)
+        if self.bounded:
+            learned_gate = self.g_min + (1.0 - self.g_min) * torch.sigmoid(
+                (logits + self.bias) / self.temperature
+            )
+        else:
+            learned_gate = torch.sigmoid(logits + self.bias)
 
-    def pair_gates(
-        self,
-        warmup_embedding: Tensor,
-        pair_node_a: Tensor,
-        pair_node_b: Tensor,
-        pair_distribution_z: Tensor,
-        pair_log_consistency: Tensor,
-    ) -> Tensor:
-        logits_ab = self._directed_logits(
-            warmup_embedding,
-            pair_node_a,
-            pair_node_b,
-            pair_distribution_z,
-            pair_log_consistency,
-        )
-        logits_ba = self._directed_logits(
-            warmup_embedding,
-            pair_node_b,
-            pair_node_a,
-            pair_distribution_z,
-            pair_log_consistency,
-        )
-        return 0.5 * (torch.sigmoid(logits_ab) + torch.sigmoid(logits_ba))
+        if self.boundary_focused:
+            non_self_pair_id = edge_pair_id[non_self]
+            boundary_edge = pair_boundary_candidate[non_self_pair_id]
+            learned_gate = torch.where(
+                boundary_edge,
+                learned_gate,
+                torch.ones_like(learned_gate),
+            )
+
+        gates[non_self] = learned_gate
+        return gates
 
 
 class GatedSTAGATE(nn.Module):
@@ -304,8 +344,16 @@ class GatedSTAGATE(nn.Module):
         features: Tensor,
         edge_index: Tensor,
         edge_gate: OptTensor = None,
+        renormalize_gate: bool = False,
     ) -> Tuple[Tensor, Tensor]:
-        h1 = F.elu(self.conv1(features, edge_index, edge_gate=edge_gate))
+        h1 = F.elu(
+            self.conv1(
+                features,
+                edge_index,
+                edge_gate=edge_gate,
+                renormalize_gate=renormalize_gate,
+            )
+        )
         h2 = self.conv2(h1, edge_index, attention=False)
         self.conv3.lin_src.data = self.conv2.lin_src.transpose(0, 1)
         self.conv3.lin_dst.data = self.conv2.lin_dst.transpose(0, 1)
@@ -316,6 +364,7 @@ class GatedSTAGATE(nn.Module):
                 h2,
                 edge_index,
                 edge_gate=edge_gate,
+                renormalize_gate=renormalize_gate,
                 attention=True,
                 tied_attention=self.conv1.attentions,
             )
