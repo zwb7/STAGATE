@@ -30,6 +30,7 @@ import torch
 from sklearn.metrics import adjusted_rand_score
 
 import STAGATE_pyG as STAGATE
+from preprocessing import LOG_NORMALIZE, PREPROCESS_MODES, preprocess_expression
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,6 +71,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=400.0,
         help="Radius cutoff in full-resolution Visium pixel coordinates.",
+    )
+    parser.add_argument(
+        "--preprocess-mode",
+        choices=PREPROCESS_MODES,
+        default=LOG_NORMALIZE,
+        help=(
+            "Expression preprocessing mode. The default preserves the current "
+            "baseline: HVG selection with seurat_v3, normalize_total, and log1p. "
+            "Use sctransform to preprocess with Seurat::SCTransform."
+        ),
     )
     parser.add_argument("--n-top-genes", type=int, default=3000)
     parser.add_argument("--hidden-dim", type=int, default=512)
@@ -148,15 +159,6 @@ def load_hbc(
     return adata
 
 
-def preprocess(adata: sc.AnnData, n_top_genes: int) -> None:
-    sc.pp.highly_variable_genes(
-        adata,
-        flavor="seurat_v3",
-        n_top_genes=n_top_genes,
-    )
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
-
 
 def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
     warnings.filterwarnings("ignore")
@@ -195,7 +197,7 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
             f"column contains {n_truth_classes} classes."
         )
 
-    preprocess(adata, args.n_top_genes)
+    preprocess_expression(adata, args.n_top_genes, mode=args.preprocess_mode)
 
     sc.pl.spatial(
         adata,
@@ -287,6 +289,8 @@ def train_and_evaluate(args: argparse.Namespace) -> dict[str, object]:
         "n_ground_truth_classes": n_truth_classes,
         "n_clusters": args.clusters,
         "radius": args.radius,
+        "preprocess_mode": args.preprocess_mode,
+        "n_top_genes": args.n_top_genes,
         "ari": float(ari),
         "final_reconstruction_loss": final_loss,
         "device": str(device),
