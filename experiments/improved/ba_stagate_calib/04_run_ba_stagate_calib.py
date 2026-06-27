@@ -11,7 +11,8 @@ calibration:
   2. Select top boundary_ratio spots as boundary candidates.
   3. Build high-confidence, low-boundary domain-core prototypes.
   4. Reassign only boundary candidates if a local candidate domain exceeds the
-     original label score by a fixed margin.
+     original label score by a fixed margin and satisfies conservative evidence
+     constraints on spatial support and prototype similarity.
   5. Report STAGATE vs BA-STAGATE-Calib metrics.
 """
 
@@ -249,12 +250,7 @@ def posterior_value(
     if posterior is not None:
         col = label_to_col.get(label)
         return float(posterior[spot_idx, col]) if col is not None else 0.0
-    if label == original_label:
-        return float(confidence[spot_idx])
-    n_labels = max(1, len(label_to_col))
-    if n_labels == 1:
-        return 0.0
-    return float((1.0 - confidence[spot_idx]) / (n_labels - 1))
+    return 0.0
 
 
 def spatial_support(label: str, labels: np.ndarray, neigh: Sequence[int]) -> float:
@@ -282,6 +278,8 @@ def run_calibration(
     alpha: float,
     beta: float,
     gamma: float,
+    require_spatial_gain: float,
+    require_proto_gain: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     _check_required_keys(adata, embedding_key, pred_key, spatial_net_key, truth_key)
 
@@ -363,12 +361,23 @@ def run_calibration(
             )
 
         best_label = max(score_parts, key=lambda item: score_parts[item][0])
-        original_score = score_parts[original][0]
+        original_parts = score_parts[original]
+        original_score = original_parts[0]
         best_score = score_parts[best_label][0]
+        proto_gain = score_parts[best_label][1] - original_parts[1]
+        spatial_gain = score_parts[best_label][2] - original_parts[2]
         score_margin = best_score - original_score
+        passes_spatial_gain = spatial_gain >= require_spatial_gain
+        passes_proto_gain = proto_gain > require_proto_gain
         changed = False
 
-        if boundary_candidates[idx] and best_label != original and score_margin > margin:
+        if (
+            boundary_candidates[idx]
+            and best_label != original
+            and score_margin > margin
+            and passes_spatial_gain
+            and passes_proto_gain
+        ):
             calibrated[idx] = best_label
             changed = True
 
@@ -389,8 +398,15 @@ def run_calibration(
                 "original_score": float(original_score),
                 "best_score": float(best_score),
                 "score_margin": float(score_margin),
+                "original_proto_similarity": float(original_parts[1]),
                 "best_proto_similarity": float(best_parts[1]),
+                "proto_gain": float(proto_gain),
+                "original_spatial_support": float(original_parts[2]),
                 "best_spatial_support": float(best_parts[2]),
+                "spatial_gain": float(spatial_gain),
+                "passes_spatial_gain": bool(passes_spatial_gain),
+                "passes_proto_gain": bool(passes_proto_gain),
+                "original_posterior": float(original_parts[3]),
                 "best_posterior": float(best_parts[3]),
             }
         )
@@ -550,10 +566,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tau-core", default=0.90, type=float)
     parser.add_argument("--core-quantile", default=0.50, type=float)
     parser.add_argument("--top-k-proto", default=2, type=int)
-    parser.add_argument("--margin", default=0.05, type=float)
+    parser.add_argument("--margin", default=0.0, type=float)
     parser.add_argument("--alpha", default=1.0, type=float)
     parser.add_argument("--beta", default=0.5, type=float)
-    parser.add_argument("--gamma", default=0.5, type=float)
+    parser.add_argument("--gamma", default=0.25, type=float)
+    parser.add_argument(
+        "--require-spatial-gain",
+        default=0.10,
+        type=float,
+        help="Minimum spatial support gain required before relabeling.",
+    )
+    parser.add_argument(
+        "--require-proto-gain",
+        default=0.00,
+        type=float,
+        help="Minimum prototype similarity gain required before relabeling.",
+    )
     parser.add_argument(
         "--save-h5ad",
         action="store_true",
@@ -583,6 +611,8 @@ def main() -> None:
         alpha=args.alpha,
         beta=args.beta,
         gamma=args.gamma,
+        require_spatial_gain=args.require_spatial_gain,
+        require_proto_gain=args.require_proto_gain,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -608,6 +638,8 @@ def main() -> None:
         "alpha": args.alpha,
         "beta": args.beta,
         "gamma": args.gamma,
+        "require_spatial_gain": args.require_spatial_gain,
+        "require_proto_gain": args.require_proto_gain,
     }
     with (args.output_dir / "ba_stagate_calib_config.json").open("w", encoding="utf-8") as fh:
         json.dump(config, fh, indent=2)
