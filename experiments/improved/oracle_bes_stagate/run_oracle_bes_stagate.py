@@ -1,4 +1,4 @@
-"""Run Oracle-BES-STAGATE feasibility experiments.
+﻿"""Run Oracle-BES-STAGATE feasibility experiments.
 
 This script is intended for the remote server. It may train a model depending
 on ``--experiment`` and ``--training-mode``. Do not run it locally for smoke
@@ -70,6 +70,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-id", required=True)
     parser.add_argument("--input-h5ad", type=Path, required=True)
     parser.add_argument("--experiment", choices=EXPERIMENTS, required=True)
+    parser.add_argument(
+        "--run-tag",
+        default=None,
+        help=(
+            "Optional suffix for the output run directory, for example "
+            "O3_gamma002_pres02. This is useful for parameter diagnostics."
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -646,6 +654,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "sample_id": args.sample_id,
         "experiment": args.experiment,
+        "run_tag": args.run_tag,
         "training_mode": args.training_mode,
         "input_h5ad": str(args.input_h5ad),
         "n_spots": int(adata.n_obs),
@@ -665,7 +674,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "final_loss_pres": training_log[-1].get("loss_pres") if training_log else None,
     }
 
-    run_dir = args.output_dir / args.sample_id / f"seed_{args.seed}" / args.experiment
+    run_name = args.experiment if args.run_tag is None else f"{args.experiment}_{args.run_tag}"
+    run_dir = args.output_dir / args.sample_id / f"seed_{args.seed}" / run_name
     config = build_config(args)
     save_outputs(
         args,

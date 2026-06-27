@@ -1,4 +1,4 @@
-# Oracle-BES-STAGATE
+﻿# Oracle-BES-STAGATE
 
 This directory contains an isolated oracle feasibility / sanity-check
 experiment. It does not modify the official `STAGATE_pyG/` baseline.
