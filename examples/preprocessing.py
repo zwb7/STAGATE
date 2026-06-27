@@ -123,11 +123,20 @@ def _preprocess_sctransform(adata: sc.AnnData, n_top_genes: int) -> None:
 
         sct_data <- get_sct_assay_data(sct_obj, "SCT", "data")
         sct_data <- methods::as(sct_data, "dgCMatrix")
+        sct_data_genes <- rownames(sct_data)
+        sct_data_cells <- colnames(sct_data)
         sct_variable_features <- Seurat::VariableFeatures(sct_obj)
         """
     )
 
-    adata.X = _r_dgcmatrix_to_cell_by_gene_csr(ro.r["sct_data"])
+    sct_genes = [str(name) for name in ro.r["sct_data_genes"]]
+    sct_cells = [str(name) for name in ro.r["sct_data_cells"]]
+    adata.X = _align_sct_matrix_to_adata(
+        _r_dgcmatrix_to_cell_by_gene_csr(ro.r["sct_data"]),
+        sct_genes,
+        sct_cells,
+        adata,
+    )
     variable_features = [str(name) for name in ro.r["sct_variable_features"]]
     adata.var["highly_variable"] = adata.var_names.isin(variable_features)
     adata.uns["preprocessing"] = {
@@ -155,3 +164,65 @@ def _r_dgcmatrix_to_cell_by_gene_csr(r_matrix) -> sp.csr_matrix:
     shape = tuple(np.asarray(r_matrix.do_slot("Dim"), dtype=np.int32))
     gene_by_cell = sp.csc_matrix((data, rows, indptr), shape=shape)
     return gene_by_cell.T.tocsr()
+
+
+def _align_sct_matrix_to_adata(
+    sct_x: sp.csr_matrix,
+    sct_genes: list[str],
+    sct_cells: list[str],
+    adata: sc.AnnData,
+) -> sp.csr_matrix:
+    if sct_x.shape != (len(sct_cells), len(sct_genes)):
+        raise ValueError(
+            "SCT matrix shape %s does not match returned cell/gene names "
+            "(%d, %d)."
+            % (sct_x.shape, len(sct_cells), len(sct_genes))
+        )
+
+    obs_names = [str(name) for name in adata.obs_names]
+    var_names = [str(name) for name in adata.var_names]
+    cell_positions = _positions_in_order(sct_cells, obs_names, "SCT cells")
+    gene_positions = _positions_in_order(sct_genes, var_names, "SCT genes")
+
+    placed = _place_sct_genes(sct_x, gene_positions, adata.n_vars).tocoo()
+    return sp.coo_matrix(
+        (placed.data, (cell_positions[placed.row], placed.col)),
+        shape=adata.shape,
+    ).tocsr()
+
+
+def _place_sct_genes(
+    sct_x: sp.csr_matrix,
+    gene_positions: np.ndarray,
+    n_vars: int,
+) -> sp.csr_matrix:
+    gene_index = sp.coo_matrix(
+        (
+            np.ones(len(gene_positions), dtype=np.float32),
+            (np.arange(len(gene_positions)), gene_positions),
+        ),
+        shape=(len(gene_positions), n_vars),
+    ).tocsr()
+    return sct_x @ gene_index
+
+
+def _positions_in_order(
+    returned_names: list[str],
+    expected_names: list[str],
+    label: str,
+) -> np.ndarray:
+    expected_positions = {name: index for index, name in enumerate(expected_names)}
+    positions = []
+    missing = []
+    for name in returned_names:
+        position = expected_positions.get(name)
+        if position is None:
+            missing.append(name)
+        else:
+            positions.append(position)
+    if missing:
+        raise ValueError(
+            "%s returned names absent from AnnData, for example: %s"
+            % (label, ", ".join(missing[:5]))
+        )
+    return np.asarray(positions, dtype=np.int64)
