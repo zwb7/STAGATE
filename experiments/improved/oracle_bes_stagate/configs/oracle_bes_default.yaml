@@ -1,0 +1,22 @@
+output_dir: results/oracle_bes_stagate
+embedding_key: STAGATE
+ground_truth_key: Ground Truth
+clusters: 7
+mclust_model: EEE
+seed: 0
+device: cuda:7
+training_mode: frozen_adapter
+epochs: 1000
+warmup_ratio: 0.5
+learning_rate: 0.001
+adapter_learning_rate: 0.001
+weight_decay: 0.0001
+hidden_dim: 512
+latent_dim: 30
+dropout: 0.1
+gamma: 0.05
+lambda_bes: 0.05
+lambda_pres: 1.0
+temperature: 0.5
+gradient_clipping: 5.0
+min_core_spots: 5
