@@ -1,4 +1,4 @@
-"""Evaluation helpers for Oracle-BES-STAGATE."""
+﻿"""Evaluation helpers for Oracle-BES-STAGATE."""
 
 from __future__ import annotations
 
@@ -284,11 +284,32 @@ def summarize_runs_to_markdown(results_root: Path, output_path: Path) -> None:
     ]
     lines.append("## Metrics")
     lines.append("")
-    lines.append(table[selected].to_markdown(index=False))
+    lines.append(dataframe_to_markdown(table[selected]))
     lines.append("")
     lines.append("Go / No-Go should be judged after the planned server runs finish.")
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
+def dataframe_to_markdown(table: pd.DataFrame) -> str:
+    """Render a small markdown table without pandas' optional tabulate dependency."""
+    if table.empty:
+        return ""
+    columns = [str(column) for column in table.columns]
+    rows = []
+    for _, row in table.iterrows():
+        rows.append([_format_markdown_cell(row[column]) for column in table.columns])
+    header = "| " + " | ".join(columns) + " |"
+    separator = "| " + " | ".join(["---"] * len(columns)) + " |"
+    body = ["| " + " | ".join(row) + " |" for row in rows]
+    return "\n".join([header, separator, *body])
+
+
+def _format_markdown_cell(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    text = str(value)
+    return text.replace("|", "\\|").replace("\n", " ")
 
 def flatten_dict(payload: dict[str, Any]) -> dict[str, Any]:
     flat: dict[str, Any] = {}
