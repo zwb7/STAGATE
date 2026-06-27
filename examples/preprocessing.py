@@ -1,4 +1,4 @@
-"""Shared preprocessing helpers for STAGATE example experiments."""
+﻿"""Shared preprocessing helpers for STAGATE example experiments."""
 
 from __future__ import annotations
 
@@ -95,6 +95,10 @@ def _preprocess_sctransform(adata: sc.AnnData, n_top_genes: int) -> None:
             counts = sct_counts,
             assay = "Spatial"
         )
+        options(future.globals.maxSize = 8 * 1024^3)
+        if (requireNamespace("future", quietly = TRUE)) {
+            future::plan("sequential")
+        }
         sct_obj <- Seurat::SCTransform(
             sct_obj,
             assay = "Spatial",
@@ -226,3 +230,4 @@ def _positions_in_order(
             % (label, ", ".join(missing[:5]))
         )
     return np.asarray(positions, dtype=np.int64)
+
