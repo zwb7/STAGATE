@@ -84,3 +84,24 @@ bash experiments/improved/oracle_bes_stagate/scripts/run_151676.sh
 
 If `O2` / `O3` do not improve over `O0`, pause. If they improve, continue with
 `151673`, then `151674` and `151507`.
+
+## O6 hard boundary-gated mechanism check
+
+After the frozen-adapter No-Go result, O6 is the final narrow mechanism check:
+interior spots are preserved by construction, not by a preservation loss.
+
+```text
+z'_i = z_i                         for GT-interior spots
+z'_i = z_i + gamma * h(z_i)         for GT-boundary spots
+```
+
+Run only on `151676` first:
+
+```bash
+bash experiments/improved/oracle_bes_stagate/scripts/run_151676_o6.sh
+```
+
+The O6 output includes the normal full-mclust metrics on `Oracle_BES_STAGATE`
+and additional `boundary_relabel_*` metrics for boundary-only fixed-prototype
+assignment, where interior labels are copied from O0 and only GT-boundary spots
+are reassigned to fixed O0 interior cluster prototypes.

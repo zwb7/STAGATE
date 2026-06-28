@@ -205,6 +205,39 @@ def perturbation_metrics(
     }
 
 
+
+def fixed_prototype_boundary_relabel(
+    embedding: np.ndarray,
+    baseline_labels: np.ndarray,
+    boundary_mask: np.ndarray,
+    interior_mask: np.ndarray,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
+    """Relabel only boundary spots by nearest fixed O0 interior cluster prototype."""
+    relabeled = baseline_labels.copy()
+    prototype_mask = interior_mask & valid_mask
+    boundary_eval = boundary_mask & valid_mask
+    prototype_labels = np.asarray(sorted(np.unique(baseline_labels[prototype_mask])))
+    if prototype_labels.size == 0 or not boundary_eval.any():
+        return relabeled
+
+    prototypes = []
+    for label in prototype_labels:
+        members = prototype_mask & (baseline_labels == label)
+        if members.any():
+            prototypes.append(embedding[members].mean(axis=0))
+    if not prototypes:
+        return relabeled
+
+    prototypes_array = np.vstack(prototypes)
+    boundary_indices = np.flatnonzero(boundary_eval)
+    distances = np.sum(
+        (embedding[boundary_indices, None, :] - prototypes_array[None, :, :]) ** 2,
+        axis=2,
+    )
+    relabeled[boundary_indices] = prototype_labels[np.argmin(distances, axis=1)]
+    return relabeled
+
 def label_change_metrics(
     baseline_labels: np.ndarray,
     refined_labels: np.ndarray,
@@ -273,12 +306,16 @@ def summarize_runs_to_markdown(results_root: Path, output_path: Path) -> None:
         for column in [
             "sample_id",
             "experiment",
+            "run_tag",
             "ari",
             "gt_boundary_ari",
             "gt_interior_ari",
             "nmi",
             "ami",
             "mean_l2_perturbation",
+            "boundary_relabel_ari",
+            "boundary_relabel_gt_boundary_ari",
+            "boundary_relabel_gt_interior_ari",
         ]
         if column in table.columns
     ]

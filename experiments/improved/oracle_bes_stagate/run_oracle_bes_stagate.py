@@ -37,6 +37,7 @@ from evaluate_oracle_bes import (
     compute_metrics,
     correction_stats,
     flatten_dict,
+    fixed_prototype_boundary_relabel,
     label_change_metrics,
     matched_prediction_errors,
     mclust_with_posterior,
@@ -59,7 +60,7 @@ from oracle_boundary import (
 )
 
 
-EXPERIMENTS = ("O0", "O1", "O2", "O3", "O4")
+EXPERIMENTS = ("O0", "O1", "O2", "O3", "O4", "O6")
 TRAINING_MODES = ("frozen_adapter", "warmup_last_layer")
 
 
@@ -112,6 +113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma", type=float, default=0.05)
     parser.add_argument("--lambda-bes", type=float, default=0.05)
     parser.add_argument("--lambda-pres", type=float, default=1.0)
+    parser.add_argument("--lambda-mag", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--gradient-clipping", type=float, default=5.0)
     parser.add_argument("--min-core-spots", type=int, default=5)
@@ -205,7 +207,7 @@ def experiment_train_mask(
 ) -> np.ndarray:
     if args.experiment == "O1":
         return boundary_data.valid_mask.copy()
-    if args.experiment in {"O2", "O3"}:
+    if args.experiment in {"O2", "O3", "O6"}:
         return boundary_data.gt_boundary_mask.copy()
     if args.experiment == "O4":
         return random_boundary_mask(
@@ -284,12 +286,39 @@ def compute_oracle_losses(
             refined_embedding,
             interior_indices,
         )
-    loss = args.lambda_bes * loss_bes + args.lambda_pres * loss_pres
+    loss_mag = refined_embedding.sum() * 0.0
+    if args.experiment == "O6" and args.lambda_mag > 0:
+        loss_mag = interior_preservation_loss(
+            original_embedding,
+            refined_embedding,
+            train_indices,
+        )
+    loss = (
+        args.lambda_bes * loss_bes
+        + args.lambda_pres * loss_pres
+        + args.lambda_mag * loss_mag
+    )
     return loss, {
         "loss_bes": float(loss_bes.detach().cpu()),
         "loss_pres": float(loss_pres.detach().cpu()),
+        "loss_mag": float(loss_mag.detach().cpu()),
     }
 
+
+
+def apply_hard_boundary_mask(
+    original_embedding: torch.Tensor,
+    shaped_embedding: torch.Tensor,
+    boundary_mask: np.ndarray,
+    device: torch.device,
+) -> torch.Tensor:
+    """Apply O6 structural interior preservation: only GT-boundary spots move."""
+    mask = torch.as_tensor(
+        boundary_mask.astype(np.float32),
+        dtype=torch.float32,
+        device=device,
+    ).unsqueeze(1)
+    return original_embedding + mask * (shaped_embedding - original_embedding)
 
 def train_frozen_adapter(
     args: argparse.Namespace,
@@ -320,6 +349,13 @@ def train_frozen_adapter(
         shaper.train()
         optimizer.zero_grad()
         refined = shaper(original_embedding, gamma=args.gamma)
+        if args.experiment == "O6":
+            refined = apply_hard_boundary_mask(
+                original_embedding,
+                refined,
+                boundary_data.gt_boundary_mask,
+                device,
+            )
         oracle_loss, loss_parts = compute_oracle_losses(
             args,
             refined,
@@ -343,7 +379,15 @@ def train_frozen_adapter(
 
     shaper.eval()
     with torch.no_grad():
-        refined_np = shaper(original_embedding, gamma=args.gamma).detach().cpu().numpy()
+        refined = shaper(original_embedding, gamma=args.gamma)
+        if args.experiment == "O6":
+            refined = apply_hard_boundary_mask(
+                original_embedding,
+                refined,
+                boundary_data.gt_boundary_mask,
+                device,
+            )
+        refined_np = refined.detach().cpu().numpy()
     return original_embedding_np, refined_np, training_log
 
 
@@ -492,6 +536,7 @@ def save_outputs(
     refined_errors: np.ndarray,
     original_embedding: np.ndarray,
     refined_embedding: np.ndarray,
+    boundary_relabel_labels: np.ndarray | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     write_yaml(output_dir / "config.yaml", config)
@@ -540,6 +585,8 @@ def save_outputs(
             ),
         }
     )
+    if boundary_relabel_labels is not None:
+        labels["o6_boundary_relabel"] = boundary_relabel_labels
     labels.to_csv(output_dir / "labels.csv", index=False)
 
     adata.obsm["STAGATE"] = original_embedding
@@ -549,6 +596,8 @@ def save_outputs(
     adata.obs["changed_label"] = changed
     adata.obs["correct_before"] = (~baseline_errors) & boundary_data.valid_mask
     adata.obs["correct_after"] = (~refined_errors) & boundary_data.valid_mask
+    if boundary_relabel_labels is not None:
+        adata.obs["o6_boundary_relabel"] = pd.Categorical(boundary_relabel_labels.astype(str))
     if not args.no_save_h5ad:
         adata.write_h5ad(output_dir / "embeddings.h5ad")
 
@@ -563,6 +612,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
 
     if not args.input_h5ad.exists():
         raise FileNotFoundError(f"Input h5ad not found: {args.input_h5ad}")
+    if args.experiment == "O6" and args.training_mode != "frozen_adapter":
+        raise ValueError("O6 currently supports only --training-mode frozen_adapter")
     device = resolve_device(args.device)
     adata = sc.read_h5ad(args.input_h5ad)
     require_embedding = args.experiment == "O0" or args.training_mode == "frozen_adapter"
@@ -651,6 +702,42 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         refined_labels,
         boundary_data.valid_mask,
     )
+    boundary_relabel_labels = None
+    boundary_relabel_metrics: dict[str, Any] = {}
+    if args.experiment == "O6":
+        boundary_relabel_labels = fixed_prototype_boundary_relabel(
+            refined_embedding,
+            baseline_labels,
+            boundary_data.gt_boundary_mask,
+            boundary_data.gt_interior_mask,
+            boundary_data.valid_mask,
+        )
+        boundary_relabel_metrics = {
+            f"boundary_relabel_{key}": value
+            for key, value in {
+                **compute_metrics(
+                    refined_embedding,
+                    boundary_data.labels,
+                    boundary_relabel_labels,
+                    boundary_data.valid_mask,
+                    boundary_data.gt_boundary_mask,
+                    boundary_data.gt_interior_mask,
+                ),
+                **label_change_metrics(
+                    baseline_labels,
+                    boundary_relabel_labels,
+                    boundary_data.valid_mask,
+                    boundary_data.gt_boundary_mask,
+                    boundary_data.gt_interior_mask,
+                ),
+                **correction_stats(
+                    boundary_data.labels,
+                    baseline_labels,
+                    boundary_relabel_labels,
+                    boundary_data.valid_mask,
+                ),
+            }.items()
+        }
     metrics: dict[str, Any] = {
         "sample_id": args.sample_id,
         "experiment": args.experiment,
@@ -672,6 +759,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "final_loss_rec": training_log[-1].get("loss_rec") if training_log else None,
         "final_loss_bes": training_log[-1].get("loss_bes") if training_log else None,
         "final_loss_pres": training_log[-1].get("loss_pres") if training_log else None,
+        "final_loss_mag": training_log[-1].get("loss_mag") if training_log else None,
     }
 
     run_name = args.experiment if args.run_tag is None else f"{args.experiment}_{args.run_tag}"
@@ -691,6 +779,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         refined_errors,
         original_embedding,
         refined_embedding,
+        boundary_relabel_labels=boundary_relabel_labels,
     )
     if args.summary:
         summarize_runs_to_markdown(
