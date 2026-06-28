@@ -34,13 +34,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-h5ad",
         type=Path,
-        required=True,
+        default=None,
         help=(
             "Input AnnData file. It should already contain the intended "
-            "preprocessing and, preferably, adata.uns['Spatial_Net']."
+            "preprocessing and, preferably, adata.uns['Spatial_Net']. Use "
+            "--dataset dlpfc to load a raw DLPFC Visium slice instead."
         ),
     )
+    parser.add_argument(
+        "--dataset",
+        choices=["h5ad", "dlpfc"],
+        default="h5ad",
+        help="Input source. Use dlpfc for dataset/DLPFC/<sample-id> raw Visium data.",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("dataset/DLPFC"),
+        help="Dataset root used by --dataset dlpfc.",
+    )
     parser.add_argument("--sample-id", required=True)
+    parser.add_argument("--count-file", default="filtered_feature_bc_matrix.h5")
+    parser.add_argument(
+        "--truth-file",
+        type=Path,
+        default=None,
+        help="Ground-truth annotation file. Defaults to the slice truth file for DLPFC.",
+    )
+    parser.add_argument(
+        "--preprocess-mode",
+        choices=["log-normalize", "none"],
+        default="log-normalize",
+        help="Expression preprocessing for raw dataset inputs.",
+    )
+    parser.add_argument("--n-top-genes", type=int, default=3000)
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -113,6 +140,95 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         json.dump(payload, file, indent=2, ensure_ascii=False)
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def preprocess_expression(adata: sc.AnnData, args: argparse.Namespace) -> None:
+    if args.preprocess_mode == "none":
+        adata.uns["preprocessing"] = {"mode": "none"}
+        return
+    if args.n_top_genes <= 0:
+        raise ValueError("--n-top-genes must be positive for log-normalize preprocessing.")
+    sc.pp.highly_variable_genes(
+        adata,
+        flavor="seurat_v3",
+        n_top_genes=args.n_top_genes,
+    )
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    adata.uns["preprocessing"] = {
+        "mode": "log-normalize",
+        "n_top_genes": int(args.n_top_genes),
+        "normalization": "scanpy.normalize_total(target_sum=1e4)+log1p",
+        "hvg_method": "scanpy.highly_variable_genes(flavor='seurat_v3')",
+    }
+
+
+def load_dlpfc_slice(args: argparse.Namespace) -> sc.AnnData:
+    sample_dir = args.data_root / args.sample_id
+    if not sample_dir.exists():
+        raise FileNotFoundError(f"DLPFC sample directory not found: {sample_dir}")
+    count_path = sample_dir / args.count_file
+    if not count_path.exists():
+        raise FileNotFoundError(f"DLPFC count file not found: {count_path}")
+
+    adata = sc.read_visium(path=sample_dir, count_file=args.count_file)
+    adata.var_names_make_unique()
+
+    truth_file = args.truth_file or sample_dir / f"{args.sample_id}_truth.txt"
+    if truth_file.exists():
+        truth = pd.read_csv(
+            truth_file,
+            sep="	",
+            header=None,
+            names=["spot_id", args.ground_truth_key],
+            dtype=str,
+        )
+        if truth["spot_id"].duplicated().any():
+            raise ValueError(f"Ground-truth spot IDs contain duplicates: {truth_file}")
+        truth = truth.set_index("spot_id")
+        adata.obs[args.ground_truth_key] = truth.reindex(adata.obs_names)[
+            args.ground_truth_key
+        ]
+        adata.obs[args.ground_truth_key] = adata.obs[args.ground_truth_key].astype(
+            "category"
+        )
+    else:
+        print(f"Ground-truth file not found and will be skipped: {truth_file}")
+
+    preprocess_expression(adata, args)
+    if args.radius is None and args.spatial_net_model == "Radius":
+        args.radius = 150.0
+    args.build_spatial_net = True
+    adata.uns["dataset_source"] = {
+        "dataset": "dlpfc",
+        "sample_id": args.sample_id,
+        "sample_dir": str(sample_dir),
+        "count_file": args.count_file,
+        "truth_file": str(truth_file),
+    }
+    return adata
+
+
+def load_input_adata(args: argparse.Namespace) -> sc.AnnData:
+    if args.dataset == "dlpfc":
+        print(f"Loading raw DLPFC slice {args.sample_id} from {args.data_root}")
+        return load_dlpfc_slice(args)
+    if args.input_h5ad is None:
+        raise ValueError("--input-h5ad is required when --dataset h5ad")
+    print(f"Loading AnnData from {args.input_h5ad}")
+    return sc.read_h5ad(args.input_h5ad)
 
 
 def get_git_commit() -> str | None:
@@ -366,8 +482,7 @@ def train_and_export(args: argparse.Namespace) -> dict[str, Any]:
         )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading AnnData from {args.input_h5ad}")
-    adata = sc.read_h5ad(args.input_h5ad)
+    adata = load_input_adata(args)
     ensure_spatial_net(adata, args)
     spatial_net = validate_spatial_net(adata)
     spatial_net.to_csv(output_dir / "spatial_edges.csv", index=False)
@@ -422,7 +537,9 @@ def train_and_export(args: argparse.Namespace) -> dict[str, Any]:
     result: dict[str, Any] = {
         "sample_id": args.sample_id,
         "method": "vanilla_stagate",
-        "input_h5ad": str(args.input_h5ad),
+        "dataset": args.dataset,
+        "input_h5ad": str(args.input_h5ad) if args.input_h5ad is not None else None,
+        "data_root": str(args.data_root),
         "output_dir": str(output_dir),
         "ground_truth_key": args.ground_truth_key,
         "n_spots": int(adata.n_obs),
@@ -450,7 +567,7 @@ def train_and_export(args: argparse.Namespace) -> dict[str, Any]:
         output_dir / "run_config.json",
         {
             "argv": sys.argv,
-            "args": vars(args),
+            "args": json_safe(vars(args)),
             "git_commit": result["git_commit"],
             "package_versions": result["package_versions"],
         },
