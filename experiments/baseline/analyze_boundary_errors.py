@@ -532,11 +532,18 @@ def analyze_one(
     )
     write_json(output_dir / "boundary_metrics.json", boundary_metrics)
     write_json(output_dir / "edge_homophily.json", edge_report)
+    global_ari = boundary_metrics["computed_global_ari"]
+    boundary_ari = boundary_metrics["boundary_ari"]
+    interior_ari = boundary_metrics["interior_ari"]
+    global_ari_text = "NA" if global_ari is None else f"{global_ari:.4f}"
+    boundary_ari_text = "NA" if boundary_ari is None else f"{boundary_ari:.4f}"
+    interior_ari_text = "NA" if interior_ari is None else f"{interior_ari:.4f}"
     print(
-        f"{sample_id}: boundary_error_rate={boundary_error_rate}, "
-        f"interior_error_rate={interior_error_rate}, "
-        f"boundary_ari={boundary_metrics['boundary_ari']}, "
-        f"interior_ari={boundary_metrics['interior_ari']}"
+        f"{sample_id}: global_ari={global_ari_text}, "
+        f"boundary_ari={boundary_ari_text}, "
+        f"interior_ari={interior_ari_text}, "
+        f"boundary_error_rate={boundary_error_rate}, "
+        f"interior_error_rate={interior_error_rate}"
     )
     return boundary_metrics
 

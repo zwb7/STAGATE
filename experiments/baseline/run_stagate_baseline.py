@@ -528,6 +528,9 @@ def train_and_export(args: argparse.Namespace) -> dict[str, Any]:
     pred = save_labels(output_dir, adata.obs_names, labels, ground_truth)
     correctness_info = save_spot_correctness(output_dir, pred, ground_truth)
     metrics = compute_metrics(ground_truth, pred)
+    ari_text = "NA" if metrics["ari"] is None else f"{metrics['ari']:.4f}"
+    nmi_text = "NA" if metrics["nmi"] is None else f"{metrics['nmi']:.4f}"
+    print(f"{args.sample_id}: Global ARI={ari_text}, NMI={nmi_text}")
 
     final_loss = adata.uns.get("STAGATE_loss")
     if torch.is_tensor(final_loss):
