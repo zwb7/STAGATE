@@ -89,6 +89,24 @@ def parse_args() -> argparse.Namespace:
         help="Require both edge endpoints to have max posterior >= this value.",
     )
     parser.add_argument(
+        "--expr-dissim-quantile",
+        type=float,
+        default=None,
+        help=(
+            "Optional hard gate: require expression dissimilarity to be at or "
+            "above this quantile over all spatial edges, e.g. 0.8 or 0.9."
+        ),
+    )
+    parser.add_argument(
+        "--cluster-pair-sep-quantile",
+        type=float,
+        default=None,
+        help=(
+            "Optional hard gate: require predicted-cluster pair separation to be "
+            "at or above this quantile over discordant spatial edges."
+        ),
+    )
+    parser.add_argument(
         "--ratio-denominator",
         choices=["all", "eligible"],
         default="all",
@@ -265,6 +283,54 @@ def pair_similarity(a: np.ndarray, b: np.ndarray, metric: str) -> float:
     raise ValueError(f"Unsupported similarity metric: {metric}")
 
 
+def validate_optional_quantile(value: float | None, name: str) -> None:
+    if value is None:
+        return
+    if not 0 <= value <= 1:
+        raise ValueError(f"{name} must be between 0 and 1")
+
+
+def quantile_threshold(values: pd.Series, quantile: float | None) -> float | None:
+    if quantile is None:
+        return None
+    clean = values.dropna()
+    if clean.empty:
+        return None
+    return float(clean.quantile(quantile))
+
+
+def cluster_pair_separation_map(
+    labels: pd.DataFrame,
+    features: np.ndarray,
+) -> dict[tuple[str, str], float]:
+    label_values = labels["pred_label"].astype(str).to_numpy()
+    result: dict[tuple[str, str], float] = {}
+    stats: dict[str, tuple[np.ndarray, float]] = {}
+    for label in sorted(set(label_values)):
+        subset = features[label_values == label]
+        centroid = subset.mean(axis=0)
+        if subset.shape[0] <= 1:
+            sigma = 0.0
+        else:
+            sigma = float(np.linalg.norm(subset - centroid, axis=1).mean())
+        stats[label] = (centroid, sigma)
+    labels_sorted = sorted(stats)
+    for i, label_a in enumerate(labels_sorted):
+        centroid_a, sigma_a = stats[label_a]
+        for label_b in labels_sorted[i + 1 :]:
+            centroid_b, sigma_b = stats[label_b]
+            denom = sigma_a + sigma_b + 1e-12
+            separation = float(np.linalg.norm(centroid_a - centroid_b) / denom)
+            result[(label_a, label_b)] = separation
+    return result
+
+
+def cluster_pair_key(label_a: Any, label_b: Any) -> tuple[str, str]:
+    a = str(label_a)
+    b = str(label_b)
+    return (a, b) if a <= b else (b, a)
+
+
 def compute_spot_scores(
     labels: pd.DataFrame,
     posterior: np.ndarray,
@@ -312,10 +378,20 @@ def compute_edge_scores(
     features: np.ndarray,
     sim_metric: str,
     min_confidence: float,
-) -> pd.DataFrame:
-    spot_order = {spot_id: index for index, spot_id in enumerate(labels["spot_id"].astype(str))}
+    expr_dissim_quantile: float | None,
+    cluster_pair_sep_quantile: float | None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    validate_optional_quantile(expr_dissim_quantile, "--expr-dissim-quantile")
+    validate_optional_quantile(
+        cluster_pair_sep_quantile,
+        "--cluster-pair-sep-quantile",
+    )
+    spot_order = {
+        spot_id: index for index, spot_id in enumerate(labels["spot_id"].astype(str))
+    }
     label_by_spot = labels.set_index("spot_id")["pred_label"].to_dict()
     score_by_spot = spot_scores.set_index("spot_id").to_dict(orient="index")
+    separation_by_pair = cluster_pair_separation_map(labels, features)
     rows: list[dict[str, Any]] = []
     for node_a, node_b in edge_pairs[["node_a", "node_b"]].itertuples(index=False):
         idx_a = spot_order[node_a]
@@ -330,11 +406,15 @@ def compute_edge_scores(
         confidence_pass = bool(
             confidence_a >= min_confidence and confidence_b >= min_confidence
         )
+        pred_boundary_endpoint = bool(
+            score_a["local_label_conflict"] > 0 or score_b["local_label_conflict"] > 0
+        )
         sim = pair_similarity(features[idx_a], features[idx_b], sim_metric)
         expression_dissimilarity = float(1.0 - sim)
         max_boundary_score = float(
             max(score_a["boundary_score"], score_b["boundary_score"])
         )
+        pair_sep = separation_by_pair.get(cluster_pair_key(label_a, label_b), 0.0)
         risk = (
             expression_dissimilarity
             * confidence_a
@@ -354,6 +434,7 @@ def compute_edge_scores(
                 "confidence_b": confidence_b,
                 "min_endpoint_confidence": min(confidence_a, confidence_b),
                 "confidence_pass": confidence_pass,
+                "pred_boundary_endpoint": pred_boundary_endpoint,
                 "uncertainty_a": float(score_a["posterior_uncertainty"]),
                 "uncertainty_b": float(score_b["posterior_uncertainty"]),
                 "label_conflict_a": float(score_a["local_label_conflict"]),
@@ -363,11 +444,52 @@ def compute_edge_scores(
                 "max_boundary_score": max_boundary_score,
                 "similarity": sim,
                 "expression_dissimilarity": expression_dissimilarity,
+                "cluster_pair_separation": pair_sep,
                 "edge_risk": float(risk),
-                "eligible": bool(labels_discordant and confidence_pass and risk > 0),
             }
         )
-    return pd.DataFrame(rows)
+    scored = pd.DataFrame(rows)
+    expr_threshold = quantile_threshold(
+        scored["expression_dissimilarity"],
+        expr_dissim_quantile,
+    )
+    discordant_sep = scored.loc[
+        scored["labels_discordant"],
+        "cluster_pair_separation",
+    ]
+    cluster_threshold = quantile_threshold(discordant_sep, cluster_pair_sep_quantile)
+    scored["expr_dissim_threshold"] = expr_threshold
+    scored["cluster_pair_sep_threshold"] = cluster_threshold
+    scored["expr_dissim_pass"] = (
+        True
+        if expr_threshold is None
+        else scored["expression_dissimilarity"] >= expr_threshold
+    )
+    scored["cluster_pair_sep_pass"] = (
+        True
+        if cluster_threshold is None
+        else scored["cluster_pair_separation"] >= cluster_threshold
+    )
+    scored["eligible"] = (
+        scored["labels_discordant"]
+        & scored["confidence_pass"]
+        & scored["expr_dissim_pass"]
+        & scored["cluster_pair_sep_pass"]
+        & scored["pred_boundary_endpoint"]
+        & (scored["edge_risk"] > 0)
+    )
+    gate_stats = {
+        "expr_dissim_quantile": expr_dissim_quantile,
+        "expr_dissim_threshold": expr_threshold,
+        "cluster_pair_sep_quantile": cluster_pair_sep_quantile,
+        "cluster_pair_sep_threshold": cluster_threshold,
+        "expr_dissim_pass_undirected_edges": int(scored["expr_dissim_pass"].sum()),
+        "cluster_pair_sep_pass_undirected_edges": int(scored["cluster_pair_sep_pass"].sum()),
+        "pred_boundary_endpoint_undirected_edges": int(
+            scored["pred_boundary_endpoint"].sum()
+        ),
+    }
+    return scored, gate_stats
 
 
 def select_pruned_edges(
@@ -472,13 +594,15 @@ def build_bagr_graph(args: argparse.Namespace) -> dict[str, Any]:
         neighbors=neighbors,
         alpha=args.alpha_uncertainty,
     )
-    edge_scores = compute_edge_scores(
+    edge_scores, gate_stats = compute_edge_scores(
         edge_pairs=edge_pairs,
         labels=labels,
         spot_scores=spot_scores,
         features=features,
         sim_metric=args.sim_metric,
         min_confidence=args.min_confidence,
+        expr_dissim_quantile=args.expr_dissim_quantile,
+        cluster_pair_sep_quantile=args.cluster_pair_sep_quantile,
     )
     pruned, scored_edges, prune_stats = select_pruned_edges(
         edge_scores=edge_scores,
@@ -510,6 +634,7 @@ def build_bagr_graph(args: argparse.Namespace) -> dict[str, Any]:
         "alpha_uncertainty": float(args.alpha_uncertainty),
         "sim_metric": args.sim_metric,
         "min_confidence": float(args.min_confidence),
+        **gate_stats,
         "n_spots": int(labels.shape[0]),
         "original_graph": original_stats,
         "refined_graph": refined_stats,

@@ -204,6 +204,36 @@ def edge_touch_ratio(edge_pairs: pd.DataFrame, spots: set[str]) -> float | None:
     return float(touches.mean())
 
 
+def spot_prune_rates(
+    pruned_pairs: pd.DataFrame,
+    labels: pd.DataFrame,
+    boundary_spots: set[str],
+) -> dict[str, Any]:
+    evaluated_spots = set(labels.loc[labels["ground_truth"].notna(), "spot_id"].astype(str))
+    interior_spots = evaluated_spots.difference(boundary_spots)
+    touched = set(pruned_pairs["node_a"].astype(str)).union(
+        set(pruned_pairs["node_b"].astype(str))
+    )
+    boundary_touched = touched.intersection(boundary_spots)
+    interior_touched = touched.intersection(interior_spots)
+    return {
+        "boundary_spot_count": int(len(boundary_spots)),
+        "interior_spot_count": int(len(interior_spots)),
+        "boundary_spots_touched_by_pruning": int(len(boundary_touched)),
+        "interior_spots_touched_by_pruning": int(len(interior_touched)),
+        "boundary_node_prune_rate": (
+            float(len(boundary_touched) / len(boundary_spots))
+            if boundary_spots
+            else None
+        ),
+        "interior_node_prune_rate": (
+            float(len(interior_touched) / len(interior_spots))
+            if interior_spots
+            else None
+        ),
+    }
+
+
 def graph_stats(edge_pairs: pd.DataFrame, labels: pd.DataFrame) -> dict[str, Any]:
     degree = {str(spot_id): 0 for spot_id in labels["spot_id"].astype(str)}
     for node_a, node_b in edge_pairs[["node_a", "node_b"]].itertuples(index=False):
@@ -328,6 +358,27 @@ def analyze_one(
         if pruned_precision is not None and original_cross not in (None, 0)
         else None
     )
+    original_cross_count = original_gt["original_gt_cross_domain_undirected_edges"]
+    original_same_count = original_gt["original_gt_same_domain_undirected_edges"]
+    pruned_cross_count = pruned_gt["pruned_gt_cross_domain_undirected_edges"]
+    pruned_same_count = pruned_gt["pruned_gt_same_domain_undirected_edges"]
+    pruned_recall = (
+        float(pruned_cross_count / original_cross_count)
+        if original_cross_count
+        else None
+    )
+    same_domain_deletion_rate = (
+        float(pruned_same_count / original_same_count)
+        if original_same_count
+        else None
+    )
+    refined_cross = refined_gt["refined_gt_cross_domain_edge_ratio"]
+    delta_cross = (
+        float(refined_cross - original_cross)
+        if refined_cross is not None and original_cross is not None
+        else None
+    )
+    spot_rates = spot_prune_rates(pruned_pairs, labels, original_boundary)
     original_stats = graph_stats(original_pairs, labels)
     refined_stats = graph_stats(refined_pairs, labels)
     bagr_stats = read_json(bagr_dir / "graph_refinement_stats.json")
@@ -362,9 +413,15 @@ def analyze_one(
         "gt_boundary_spot_count": int(len(original_boundary)),
         "original_cross_gt_edge_ratio": original_cross,
         "pruned_cross_gt_edge_ratio": pruned_precision,
-        "refined_cross_gt_edge_ratio": refined_gt["refined_gt_cross_domain_edge_ratio"],
+        "refined_cross_gt_edge_ratio": refined_cross,
+        "delta_cross_gt_edge_ratio": delta_cross,
         "pruned_edge_precision": pruned_precision,
+        "pruned_edge_recall": pruned_recall,
         "pruned_edge_enrichment": enrichment,
+        "same_domain_deleted_count": int(pruned_same_count),
+        "cross_domain_deleted_count": int(pruned_cross_count),
+        "same_domain_deletion_rate": same_domain_deletion_rate,
+        **spot_rates,
         "original_cross_pred_edge_ratio": original_pred["original_pred_cross_domain_edge_ratio"],
         "pruned_cross_pred_edge_ratio": pruned_pred["pruned_pred_cross_domain_edge_ratio"],
         "refined_cross_pred_edge_ratio": refined_pred["refined_pred_cross_domain_edge_ratio"],
@@ -402,7 +459,14 @@ def flatten_summary(diagnosis: dict[str, Any]) -> dict[str, Any]:
         "pruned_edge_precision",
         "pruned_edge_enrichment",
         "refined_cross_gt_edge_ratio",
+        "delta_cross_gt_edge_ratio",
         "pruned_edge_touching_gt_boundary_ratio",
+        "pruned_edge_recall",
+        "same_domain_deleted_count",
+        "cross_domain_deleted_count",
+        "same_domain_deletion_rate",
+        "boundary_node_prune_rate",
+        "interior_node_prune_rate",
         "original_cross_pred_edge_ratio",
         "pruned_cross_pred_edge_ratio",
         "refined_cross_pred_edge_ratio",

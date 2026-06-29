@@ -142,6 +142,27 @@ def parse_args() -> argparse.Namespace:
         help="Optional CSV path for an aggregate summary over all input dirs.",
     )
     parser.add_argument(
+        "--boundary-edges-path",
+        type=Path,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional edge CSV(s) used only to define GT-boundary/interior masks. "
+            "Defaults to each input directory's spatial_edges.csv. For refined "
+            "runs, pass the matching baseline original spatial_edges.csv."
+        ),
+    )
+    parser.add_argument(
+        "--eval-edges-path",
+        type=Path,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional edge CSV(s) used only for graph-level metrics. Defaults to "
+            "each input directory's spatial_edges.csv."
+        ),
+    )
+    parser.add_argument(
         "--pred-label-column",
         default="pred_label",
         help="Predicted-label column in pred_labels.csv.",
@@ -239,8 +260,7 @@ def load_labels(
     return labels
 
 
-def load_edges(input_dir: Path, known_spots: set[str]) -> pd.DataFrame:
-    edge_path = input_dir / "spatial_edges.csv"
+def load_edges_from_path(edge_path: Path, known_spots: set[str]) -> pd.DataFrame:
     if not edge_path.exists():
         raise FileNotFoundError(f"Missing spatial edge file: {edge_path}")
     edges = pd.read_csv(edge_path, dtype={"Cell1": str, "Cell2": str})
@@ -252,6 +272,10 @@ def load_edges(input_dir: Path, known_spots: set[str]) -> pd.DataFrame:
     source_known = edges["Cell1"].isin(known_spots)
     target_known = edges["Cell2"].isin(known_spots)
     return edges.loc[source_known & target_known].reset_index(drop=True)
+
+
+def load_edges(input_dir: Path, known_spots: set[str]) -> pd.DataFrame:
+    return load_edges_from_path(input_dir / "spatial_edges.csv", known_spots)
 
 
 def undirected_edges(edges: pd.DataFrame) -> pd.DataFrame:
@@ -411,6 +435,8 @@ def analyze_one(
     input_dir: Path,
     output_dir: Path,
     args: argparse.Namespace,
+    boundary_edges_path: Path | None = None,
+    eval_edges_path: Path | None = None,
 ) -> dict[str, Any]:
     output_files = [
         output_dir / "boundary_mask.csv",
@@ -431,9 +457,14 @@ def analyze_one(
     metrics_global = read_json(input_dir / "metrics_global.json")
     sample_id = infer_sample_id(input_dir, metrics_global, args.sample_id)
     labels = load_labels(input_dir, args.pred_label_column, args.ground_truth_column)
-    edges = load_edges(input_dir, set(labels["spot_id"].astype(str)))
-    edge_pairs = undirected_edges(edges)
-    neighbors = build_neighbors(edge_pairs, labels["spot_id"])
+    known_spots = set(labels["spot_id"].astype(str))
+    boundary_edges_path = boundary_edges_path or input_dir / "spatial_edges.csv"
+    eval_edges_path = eval_edges_path or input_dir / "spatial_edges.csv"
+    boundary_edges = load_edges_from_path(boundary_edges_path, known_spots)
+    eval_edges = load_edges_from_path(eval_edges_path, known_spots)
+    boundary_edge_pairs = undirected_edges(boundary_edges)
+    eval_edge_pairs = undirected_edges(eval_edges)
+    neighbors = build_neighbors(boundary_edge_pairs, labels["spot_id"])
     boundary = boundary_table(labels, neighbors)
 
     correctness, mapping = best_label_match_correctness(labels)
@@ -470,12 +501,15 @@ def analyze_one(
         correct, "gt_cross_domain_neighbor_ratio"
     ].dropna()
 
-    gt_edge = edge_homophily(edge_pairs, labels, "ground_truth")
-    pred_edge = edge_homophily(edge_pairs, labels, "pred_label")
+    gt_edge = edge_homophily(eval_edge_pairs, labels, "ground_truth")
+    pred_edge = edge_homophily(eval_edge_pairs, labels, "pred_label")
     edge_report = {
         "sample_id": sample_id,
         "input_dir": str(input_dir),
-        "n_undirected_edges": int(edge_pairs.shape[0]),
+        "boundary_edges_path": str(boundary_edges_path),
+        "eval_edges_path": str(eval_edges_path),
+        "n_boundary_undirected_edges": int(boundary_edge_pairs.shape[0]),
+        "n_eval_undirected_edges": int(eval_edge_pairs.shape[0]),
         "ground_truth": gt_edge,
         "predicted": pred_edge,
     }
@@ -483,6 +517,11 @@ def analyze_one(
     boundary_metrics: dict[str, Any] = {
         "sample_id": sample_id,
         "input_dir": str(input_dir),
+        "boundary_definition": "fixed_reference_graph" if boundary_edges_path != input_dir / "spatial_edges.csv" else "input_spatial_graph",
+        "boundary_edges_path": str(boundary_edges_path),
+        "eval_edges_path": str(eval_edges_path),
+        "n_boundary_undirected_edges": int(boundary_edge_pairs.shape[0]),
+        "n_eval_undirected_edges": int(eval_edge_pairs.shape[0]),
         "n_spots": int(labels.shape[0]),
         "n_evaluated_spots": int(evaluated.sum()),
         "global_ari": safe_float(metrics_global.get("ari")),
@@ -548,6 +587,23 @@ def analyze_one(
     return boundary_metrics
 
 
+def match_optional_paths(
+    paths: list[Path] | None,
+    expected_count: int,
+    option_name: str,
+) -> list[Path | None]:
+    if not paths:
+        return [None] * expected_count
+    if len(paths) == 1:
+        return list(paths) * expected_count
+    if len(paths) != expected_count:
+        raise ValueError(
+            f"{option_name} expects either one path or {expected_count} paths, "
+            f"got {len(paths)}"
+        )
+    return list(paths)
+
+
 def main() -> None:
     args = parse_args()
     if args.output_dir is not None and len(args.input_dir) > 1:
@@ -555,10 +611,21 @@ def main() -> None:
     if args.sample_id is not None and len(args.input_dir) > 1:
         raise ValueError("--sample-id override is only supported with one --input-dir")
 
+    boundary_paths = match_optional_paths(args.boundary_edges_path, len(args.input_dir), "--boundary-edges-path")
+    eval_paths = match_optional_paths(args.eval_edges_path, len(args.input_dir), "--eval-edges-path")
+
     summaries = []
-    for input_dir in args.input_dir:
+    for index, input_dir in enumerate(args.input_dir):
         output_dir = args.output_dir if args.output_dir is not None else input_dir
-        summaries.append(analyze_one(input_dir, output_dir, args))
+        summaries.append(
+            analyze_one(
+                input_dir,
+                output_dir,
+                args,
+                boundary_edges_path=boundary_paths[index],
+                eval_edges_path=eval_paths[index],
+            )
+        )
 
     if args.summary_output is not None:
         args.summary_output.parent.mkdir(parents=True, exist_ok=True)
