@@ -505,6 +505,7 @@ def analyze_one(
     pred_edge = edge_homophily(eval_edge_pairs, labels, "pred_label")
     edge_report = {
         "sample_id": sample_id,
+        "seed": metrics_global.get("seed"),
         "input_dir": str(input_dir),
         "boundary_edges_path": str(boundary_edges_path),
         "eval_edges_path": str(eval_edges_path),
@@ -516,6 +517,7 @@ def analyze_one(
 
     boundary_metrics: dict[str, Any] = {
         "sample_id": sample_id,
+        "seed": metrics_global.get("seed"),
         "input_dir": str(input_dir),
         "boundary_definition": "fixed_reference_graph" if boundary_edges_path != input_dir / "spatial_edges.csv" else "input_spatial_graph",
         "boundary_edges_path": str(boundary_edges_path),
