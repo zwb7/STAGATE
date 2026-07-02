@@ -1,6 +1,34 @@
 import argparse
 from pathlib import Path
 
+
+def require_python_packages():
+    missing = []
+    for package, module in [
+        ("matplotlib", "matplotlib"),
+        ("pandas", "pandas"),
+        ("scanpy", "scanpy"),
+    ]:
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(package)
+
+    if missing:
+        joined = " ".join(missing)
+        raise SystemExit(
+            "Missing Python package(s): " + ", ".join(missing) + "\n"
+            "Install them in the visualization environment, for example:\n"
+            f"  mamba install -c conda-forge {joined}\n"
+            "or:\n"
+            f"  conda install -c conda-forge {joined}\n"
+            "or with pip if that is how the environment is managed:\n"
+            f"  python -m pip install {joined}"
+        )
+
+
+require_python_packages()
+
 import matplotlib
 
 matplotlib.use("Agg")

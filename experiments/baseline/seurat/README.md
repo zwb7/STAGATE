@@ -1,4 +1,4 @@
-﻿# Seurat Spatial Clustering Baseline
+# Seurat Spatial Clustering Baseline
 
 This folder contains a Seurat-based clustering workflow plus Scanpy spatial
 visualization for 10x Visium-style spatial transcriptomics data such as DLPFC
@@ -6,6 +6,59 @@ slices and HBC.
 
 The script is intended as a comparison baseline. It does not modify the official
 STAGATE implementation in `STAGATE_pyG/`.
+
+## Server Environment
+
+The R clustering script requires Seurat. It uses base R for argument parsing,
+parameter logging, and ARI calculation, so `optparse`, `jsonlite`, and `mclust`
+are not required.
+
+Do not install Seurat into the existing Python/GPU environment if conda reports
+large dependency conflicts. Use a separate R environment for the Seurat baseline:
+
+```bash
+mamba create -n stagate-seurat -c conda-forge --strict-channel-priority \
+  r-base=4.3 r-seurat r-seuratobject r-hdf5r
+conda activate stagate-seurat
+```
+
+If `mamba` is unavailable, use conda:
+
+```bash
+conda create -n stagate-seurat -c conda-forge --strict-channel-priority \
+  r-base=4.3 r-seurat r-seuratobject r-hdf5r
+conda activate stagate-seurat
+```
+
+Installing these packages directly into a mixed existing environment can force
+conda to reconcile unrelated packages such as `hdf5`, `curl`, compiler runtimes,
+and Python stack dependencies. A clean R environment is more reproducible and
+keeps comparison-method dependencies isolated.
+
+Alternatively, install from CRAN inside an R environment:
+
+```r
+install.packages("Seurat", repos = "https://cloud.r-project.org")
+install.packages("hdf5r", repos = "https://cloud.r-project.org")
+```
+
+The PNG visualization script requires Python packages `scanpy`, `pandas`, and
+`matplotlib`. If the current Python environment does not already have them,
+install them in a Python visualization environment:
+
+```bash
+mamba create -n stagate-scanpy -c conda-forge --strict-channel-priority \
+  python=3.10 scanpy pandas matplotlib h5py
+conda activate stagate-scanpy
+```
+
+Or install them into an existing compatible Python environment:
+
+```bash
+mamba install -c conda-forge scanpy pandas matplotlib h5py
+```
+
+If `mamba` is unavailable, replace `mamba` with `conda`.
 
 ## Inputs
 

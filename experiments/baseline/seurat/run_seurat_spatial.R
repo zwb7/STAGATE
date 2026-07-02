@@ -1,50 +1,87 @@
+if (!requireNamespace("Seurat", quietly = TRUE)) {
+  stop(
+    "R package Seurat is required but not installed. Install it on the server first, for example:\n",
+    "  conda install -c conda-forge r-seurat r-seuratobject r-hdf5r\n",
+    "or inside R:\n",
+    "  install.packages('Seurat', repos = 'https://cloud.r-project.org')",
+    call. = FALSE
+  )
+}
+
 suppressPackageStartupMessages({
   library(Seurat)
-  library(mclust)
-  library(optparse)
-  library(jsonlite)
 })
 
-option_list <- list(
-  make_option("--data_dir", type = "character",
-              help = "10x Visium sample directory."),
-  make_option("--sample_id", type = "character",
-              help = "Sample ID, e.g. 151507 or HBC."),
-  make_option("--out_dir", type = "character", default = "results/seurat",
-              help = "Output root directory [default: %default]."),
-  make_option("--counts_file", type = "character",
-              default = "filtered_feature_bc_matrix.h5",
-              help = "Count matrix file inside data_dir [default: %default]."),
-  make_option("--resolution", type = "double", default = 0.5,
-              help = "Seurat clustering resolution [default: %default]."),
-  make_option("--dims", type = "character", default = "1:30",
-              help = "PCA dimensions, e.g. 1:30 [default: %default]."),
-  make_option("--seed", type = "integer", default = 1234,
-              help = "Random seed [default: %default]."),
-  make_option("--min_features", type = "integer", default = 200,
-              help = "Minimum detected genes per spot [default: %default]."),
-  make_option("--min_counts", type = "integer", default = 500,
-              help = "Minimum UMIs per spot [default: %default]."),
-  make_option("--max_percent_mt", type = "double", default = 20,
-              help = "Maximum mitochondrial percentage [default: %default]."),
-  make_option("--nfeatures", type = "integer", default = 3000,
-              help = "Number of variable features [default: %default]."),
-  make_option("--ground_truth", type = "character", default = NULL,
-              help = "Optional CSV/TSV/TXT metadata file with spot labels."),
-  make_option("--ground_truth_no_header", action = "store_true", default = FALSE,
-              help = "Set when ground-truth file has no header [default: %default]."),
-  make_option("--barcode_col", type = "character", default = "barcode",
-              help = "Barcode column in ground-truth file [default: %default]."),
-  make_option("--label_col", type = "character", default = "ground_truth",
-              help = "Label column in ground-truth file [default: %default].")
-)
+parse_cli_args <- function(argv) {
+  defaults <- list(
+    data_dir = NULL,
+    sample_id = NULL,
+    out_dir = "results/seurat",
+    counts_file = "filtered_feature_bc_matrix.h5",
+    resolution = 0.5,
+    dims = "1:30",
+    seed = 1234,
+    min_features = 200,
+    min_counts = 500,
+    max_percent_mt = 20,
+    nfeatures = 3000,
+    ground_truth = NULL,
+    ground_truth_no_header = FALSE,
+    barcode_col = "barcode",
+    label_col = "ground_truth"
+  )
 
-opt <- parse_args(OptionParser(option_list = option_list))
+  numeric_args <- c(
+    "resolution", "seed", "min_features", "min_counts", "max_percent_mt", "nfeatures"
+  )
+  flag_args <- c("ground_truth_no_header")
+  args <- defaults
+  i <- 1
 
-required_args <- c("data_dir", "sample_id")
-missing_args <- required_args[vapply(required_args, function(x) is.null(opt[[x]]), logical(1))]
-if (length(missing_args) > 0) {
-  stop("Missing required arguments: ", paste(missing_args, collapse = ", "))
+  while (i <= length(argv)) {
+    token <- argv[[i]]
+    if (!startsWith(token, "--")) {
+      stop("Unexpected argument: ", token)
+    }
+
+    key <- sub("^--", "", token)
+    if (!key %in% names(args)) {
+      stop("Unknown argument: ", token)
+    }
+
+    if (key %in% flag_args) {
+      args[[key]] <- TRUE
+      i <- i + 1
+      next
+    }
+
+    if (i == length(argv) || startsWith(argv[[i + 1]], "--")) {
+      stop("Missing value for argument: ", token)
+    }
+
+    value <- argv[[i + 1]]
+    if (key %in% numeric_args) {
+      value <- as.numeric(value)
+      if (is.na(value)) {
+        stop("Argument ", token, " must be numeric.")
+      }
+    }
+
+    args[[key]] <- value
+    i <- i + 2
+  }
+
+  required_args <- c("data_dir", "sample_id")
+  missing_args <- required_args[vapply(required_args, function(x) is.null(args[[x]]), logical(1))]
+  if (length(missing_args) > 0) {
+    stop("Missing required arguments: ", paste(missing_args, collapse = ", "))
+  }
+
+  args$seed <- as.integer(args$seed)
+  args$min_features <- as.integer(args$min_features)
+  args$min_counts <- as.integer(args$min_counts)
+  args$nfeatures <- as.integer(args$nfeatures)
+  args
 }
 
 parse_dims <- function(dims_text) {
@@ -53,6 +90,57 @@ parse_dims <- function(dims_text) {
     return(seq.int(as.integer(bounds[1]), as.integer(bounds[2])))
   }
   as.integer(strsplit(dims_text, ",", fixed = TRUE)[[1]])
+}
+
+json_escape <- function(x) {
+  x <- gsub("\\\\", "\\\\\\\\", x)
+  gsub('"', '\\\\"', x)
+}
+
+json_value <- function(x) {
+  if (is.null(x)) {
+    return("null")
+  }
+  if (is.logical(x)) {
+    return(ifelse(x, "true", "false"))
+  }
+  if (is.numeric(x)) {
+    return(as.character(x))
+  }
+  paste0('"', json_escape(as.character(x)), '"')
+}
+
+write_params_json <- function(params, path) {
+  lines <- vapply(
+    names(params),
+    function(name) paste0('  "', name, '": ', json_value(params[[name]])),
+    character(1)
+  )
+  lines <- paste0(lines, ifelse(seq_along(lines) < length(lines), ",", ""))
+  writeLines(c("{", lines, "}"), path, useBytes = TRUE)
+}
+
+adjusted_rand_index <- function(labels_a, labels_b) {
+  labels_a <- as.factor(labels_a)
+  labels_b <- as.factor(labels_b)
+  tab <- table(labels_a, labels_b)
+  n <- sum(tab)
+  if (n < 2) {
+    return(NA_real_)
+  }
+
+  choose2 <- function(x) x * (x - 1) / 2
+  sum_comb <- sum(choose2(tab))
+  row_comb <- sum(choose2(rowSums(tab)))
+  col_comb <- sum(choose2(colSums(tab)))
+  total_comb <- choose2(n)
+  expected <- row_comb * col_comb / total_comb
+  max_index <- (row_comb + col_comb) / 2
+
+  if (max_index == expected) {
+    return(0)
+  }
+  (sum_comb - expected) / (max_index - expected)
 }
 
 read_ground_truth <- function(path, has_header, barcode_col, label_col, spot_barcodes) {
@@ -96,6 +184,7 @@ read_ground_truth <- function(path, has_header, barcode_col, label_col, spot_bar
   )
 }
 
+opt <- parse_cli_args(commandArgs(trailingOnly = TRUE))
 set.seed(opt$seed)
 dims <- parse_dims(opt$dims)
 
@@ -119,7 +208,7 @@ params <- list(
   barcode_col = opt$barcode_col,
   label_col = opt$label_col
 )
-write_json(params, file.path(sample_out, "params.json"), pretty = TRUE, auto_unbox = TRUE)
+write_params_json(params, file.path(sample_out, "params.json"))
 
 obj <- Load10X_Spatial(
   data.dir = opt$data_dir,
@@ -167,7 +256,7 @@ if (!is.null(opt$ground_truth)) {
   if (sum(valid) == 0) {
     stop("No labeled spots available for ARI calculation.")
   }
-  ari <- adjustedRandIndex(obj$seurat_clusters[valid], obj$ground_truth[valid])
+  ari <- adjusted_rand_index(obj$seurat_clusters[valid], obj$ground_truth[valid])
   cat(sprintf("ARI: %.6f\n", ari))
 
   write.csv(
