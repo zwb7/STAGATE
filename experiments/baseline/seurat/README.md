@@ -111,6 +111,24 @@ Rscript experiments/baseline/seurat/run_seurat_spatial.R \
   --ground_truth_no_header
 ```
 
+If Seurat reports `the condition has length > 1` inside `Read10X_Coordinates`,
+the sample likely contains multiple `spatial/tissue_positions*` files. The script
+now builds a temporary input directory under the sample output folder and keeps
+only one coordinate file for Seurat. By default it prefers
+`tissue_positions.parquet`, then `tissue_positions.csv`, then
+`tissue_positions_list.csv`. You can override this choice explicitly:
+
+```bash
+Rscript experiments/baseline/seurat/run_seurat_spatial.R \
+  --data_dir /data1/zhangwenbo/Code/Dataset/LIBD/151674 \
+  --sample_id 151674 \
+  --out_dir results/seurat \
+  --resolution 0.5 \
+  --dims 1:30 \
+  --ground_truth /data1/zhangwenbo/Code/Dataset/LIBD/151674/151674_truth.txt \
+  --ground_truth_no_header \
+  --coordinate_file tissue_positions_list.csv
+```
 The R script prints ARI to the terminal when ground truth is provided, for
 example:
 

@@ -18,6 +18,7 @@ parse_cli_args <- function(argv) {
     sample_id = NULL,
     out_dir = "results/seurat",
     counts_file = "filtered_feature_bc_matrix.h5",
+    coordinate_file = NULL,
     resolution = 0.5,
     dims = "1:30",
     seed = 1234,
@@ -82,6 +83,79 @@ parse_cli_args <- function(argv) {
   args$min_counts <- as.integer(args$min_counts)
   args$nfeatures <- as.integer(args$nfeatures)
   args
+}
+
+link_or_copy <- function(from, to, allow_copy = TRUE) {
+  if (file.exists(to)) {
+    return(invisible(to))
+  }
+  ok <- suppressWarnings(file.symlink(from, to))
+  if (!ok && allow_copy) {
+    ok <- file.copy(from, to, overwrite = TRUE)
+  }
+  if (!ok) {
+    stop("Failed to link input file: ", from, " -> ", to)
+  }
+  invisible(to)
+}
+
+select_coordinate_file <- function(spatial_dir, requested = NULL) {
+  if (!is.null(requested)) {
+    path <- if (file.exists(requested)) requested else file.path(spatial_dir, requested)
+    if (!file.exists(path)) {
+      stop("Requested coordinate file does not exist: ", requested)
+    }
+    return(normalizePath(path, mustWork = TRUE))
+  }
+
+  priority <- c("tissue_positions.parquet", "tissue_positions.csv", "tissue_positions_list.csv")
+  priority_paths <- file.path(spatial_dir, priority)
+  existing <- priority_paths[file.exists(priority_paths)]
+  if (length(existing) > 0) {
+    return(normalizePath(existing[[1]], mustWork = TRUE))
+  }
+
+  candidates <- list.files(
+    spatial_dir,
+    pattern = "^tissue_positions.*\\.(csv|parquet)$",
+    full.names = TRUE
+  )
+  if (length(candidates) == 0) {
+    stop("No tissue_positions CSV/parquet file found under: ", spatial_dir)
+  }
+  normalizePath(sort(candidates)[[1]], mustWork = TRUE)
+}
+
+prepare_visium_input_dir <- function(data_dir, sample_out, counts_file, coordinate_file = NULL) {
+  source_counts <- file.path(data_dir, counts_file)
+  source_spatial <- file.path(data_dir, "spatial")
+  if (!file.exists(source_counts)) {
+    stop("Count matrix file does not exist: ", source_counts)
+  }
+  if (!dir.exists(source_spatial)) {
+    stop("Spatial directory does not exist: ", source_spatial)
+  }
+
+  prepared_dir <- file.path(sample_out, "_seurat_visium_input")
+  prepared_spatial <- file.path(prepared_dir, "spatial")
+  dir.create(prepared_spatial, recursive = TRUE, showWarnings = FALSE)
+
+  link_or_copy(source_counts, file.path(prepared_dir, counts_file), allow_copy = FALSE)
+  selected_coordinate <- select_coordinate_file(source_spatial, coordinate_file)
+  old_coordinates <- list.files(
+    prepared_spatial,
+    pattern = "^tissue_positions.*\\.(csv|parquet)$",
+    full.names = TRUE
+  )
+  unlink(old_coordinates, force = TRUE)
+  spatial_files <- list.files(source_spatial, full.names = TRUE)
+  non_coordinate <- spatial_files[!grepl("^tissue_positions.*\\.(csv|parquet)$", basename(spatial_files))]
+  for (file in c(selected_coordinate, non_coordinate)) {
+    link_or_copy(file, file.path(prepared_spatial, basename(file)), allow_copy = TRUE)
+  }
+
+  message("Using coordinate file: ", basename(selected_coordinate))
+  prepared_dir
 }
 
 parse_dims <- function(dims_text) {
@@ -196,6 +270,7 @@ params <- list(
   sample_id = opt$sample_id,
   out_dir = opt$out_dir,
   counts_file = opt$counts_file,
+  coordinate_file = opt$coordinate_file,
   resolution = opt$resolution,
   dims = opt$dims,
   seed = opt$seed,
@@ -210,8 +285,15 @@ params <- list(
 )
 write_params_json(params, file.path(sample_out, "params.json"))
 
+seurat_data_dir <- prepare_visium_input_dir(
+  data_dir = opt$data_dir,
+  sample_out = sample_out,
+  counts_file = opt$counts_file,
+  coordinate_file = opt$coordinate_file
+)
+
 obj <- Load10X_Spatial(
-  data.dir = opt$data_dir,
+  data.dir = seurat_data_dir,
   filename = opt$counts_file,
   assay = "Spatial",
   slice = opt$sample_id
