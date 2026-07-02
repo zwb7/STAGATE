@@ -93,6 +93,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ignore-missing-label-edges",
+        action="store_true",
+        help=(
+            "Keep edges with missing GT labels in their original refined/pruned "
+            "lists and exclude them from oracle precision calculations and swaps."
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -182,6 +190,7 @@ def add_gt_labels(
     id_col: str,
     label_col: str,
     path: Path,
+    ignore_missing_label_edges: bool,
 ) -> pd.DataFrame:
     require_columns(labels_gt, [id_col, label_col], Path("labels_gt"))
     labelled = edges.copy()
@@ -192,8 +201,9 @@ def add_gt_labels(
     missing_label_mask = (
         labelled["_src_gt_label"].isna() | labelled["_dst_gt_label"].isna()
     )
+    labelled["_has_gt_label"] = ~missing_label_mask
     missing_label_edges = int(missing_label_mask.sum())
-    if missing_label_edges:
+    if missing_label_edges and not ignore_missing_label_edges:
         missing_nodes = sorted(
             set(labelled.loc[labelled["_src_gt_label"].isna(), source_col])
             | set(labelled.loc[labelled["_dst_gt_label"].isna(), target_col])
@@ -201,7 +211,9 @@ def add_gt_labels(
         preview = missing_nodes[:10]
         raise ValueError(
             f"{path} has {missing_label_edges} edges containing nodes without "
-            f"GT labels. First missing node ids: {preview}"
+            f"GT labels. First missing node ids: {preview}. Add "
+            f"--ignore-missing-label-edges to keep these edges unchanged and "
+            f"exclude them from oracle calculations."
         )
     return labelled
 
@@ -231,16 +243,25 @@ def filter_refined_edges(
     id_col: str,
     label_col: str,
     directed: bool,
-) -> tuple[pd.DataFrame, dict[str, int | float]]:
+    ignore_missing_label_edges: bool,
+) -> tuple[pd.DataFrame, dict[str, int | float | bool]]:
     validate_drop_ratio(drop_ratio)
     edges = prepare_edges(
         refined_edges, source_col, target_col, Path("refined_edges"), directed
     )
     edges = add_gt_labels(
-        edges, labels_gt, source_col, target_col, id_col, label_col, Path("refined_edges")
+        edges,
+        labels_gt,
+        source_col,
+        target_col,
+        id_col,
+        label_col,
+        Path("refined_edges"),
+        ignore_missing_label_edges,
     )
 
-    cross_mask = edges["_src_gt_label"] != edges["_dst_gt_label"]
+    labelled_mask = edges["_has_gt_label"]
+    cross_mask = labelled_mask & (edges["_src_gt_label"] != edges["_dst_gt_label"])
     cross_indices = edges.index[cross_mask].to_numpy()
     n_cross_before = int(len(cross_indices))
     n_drop = int(round(n_cross_before * drop_ratio))
@@ -252,13 +273,20 @@ def filter_refined_edges(
         drop_indices = np.array([], dtype=edges.index.dtype)
 
     filtered = edges.drop(index=drop_indices).copy()
+    filtered_labelled_mask = filtered["_has_gt_label"]
     n_cross_after = int(
-        (filtered["_src_gt_label"] != filtered["_dst_gt_label"]).sum()
+        (
+            filtered_labelled_mask
+            & (filtered["_src_gt_label"] != filtered["_dst_gt_label"])
+        ).sum()
     )
 
-    stats: dict[str, int | float] = {
+    stats: dict[str, int | float | bool] = {
         "input_edges": int(len(refined_edges)),
         "normalized_input_edges": int(len(edges)),
+        "labelled_edges": int(labelled_mask.sum()),
+        "missing_label_edges": int((~labelled_mask).sum()),
+        "ignore_missing_label_edges": bool(ignore_missing_label_edges),
         "gt_cross_edges_before": n_cross_before,
         "drop_ratio": float(drop_ratio),
         "dropped_gt_cross_edges": int(n_drop),
@@ -286,6 +314,7 @@ def oracle_swap_edges(
     id_col: str,
     label_col: str,
     directed: bool,
+    ignore_missing_label_edges: bool,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int | float | bool]]:
     validate_precision(target_pruned_precision)
 
@@ -296,20 +325,41 @@ def oracle_swap_edges(
         pruned_edges, source_col, target_col, Path("pruned_edges"), directed
     )
     refined = add_gt_labels(
-        refined, labels_gt, source_col, target_col, id_col, label_col, Path("refined_edges")
+        refined,
+        labels_gt,
+        source_col,
+        target_col,
+        id_col,
+        label_col,
+        Path("refined_edges"),
+        ignore_missing_label_edges,
     )
     pruned = add_gt_labels(
-        pruned, labels_gt, source_col, target_col, id_col, label_col, Path("pruned_edges")
+        pruned,
+        labels_gt,
+        source_col,
+        target_col,
+        id_col,
+        label_col,
+        Path("pruned_edges"),
+        ignore_missing_label_edges,
     )
 
-    pruned_cross_mask = pruned["_src_gt_label"] != pruned["_dst_gt_label"]
-    refined_cross_mask = refined["_src_gt_label"] != refined["_dst_gt_label"]
-    pruned_same_indices = pruned.index[~pruned_cross_mask].to_numpy()
+    pruned_labelled_mask = pruned["_has_gt_label"]
+    refined_labelled_mask = refined["_has_gt_label"]
+    pruned_cross_mask = pruned_labelled_mask & (
+        pruned["_src_gt_label"] != pruned["_dst_gt_label"]
+    )
+    refined_cross_mask = refined_labelled_mask & (
+        refined["_src_gt_label"] != refined["_dst_gt_label"]
+    )
+    pruned_same_indices = pruned.index[pruned_labelled_mask & ~pruned_cross_mask].to_numpy()
     refined_cross_indices = refined.index[refined_cross_mask].to_numpy()
 
     n_pruned = int(len(pruned))
+    n_pruned_labelled = int(pruned_labelled_mask.sum())
     current_tp = int(pruned_cross_mask.sum())
-    target_tp = int(math.ceil(target_pruned_precision * n_pruned))
+    target_tp = int(math.ceil(target_pruned_precision * n_pruned_labelled))
     needed_swaps = max(0, target_tp - current_tp)
     feasible_swaps = min(
         needed_swaps,
@@ -343,14 +393,24 @@ def oracle_swap_edges(
     new_pruned = pd.concat([pruned_remaining, promoted_edges], ignore_index=True)
     new_refined = pd.concat([refined_remaining, restored_edges], ignore_index=True)
 
+    final_pruned_labelled = int(new_pruned["_has_gt_label"].sum())
+    final_refined_labelled = int(new_refined["_has_gt_label"].sum())
     final_pruned_cross = int(
-        (new_pruned["_src_gt_label"] != new_pruned["_dst_gt_label"]).sum()
+        (
+            new_pruned["_has_gt_label"]
+            & (new_pruned["_src_gt_label"] != new_pruned["_dst_gt_label"])
+        ).sum()
     )
     final_refined_cross = int(
-        (new_refined["_src_gt_label"] != new_refined["_dst_gt_label"]).sum()
+        (
+            new_refined["_has_gt_label"]
+            & (new_refined["_src_gt_label"] != new_refined["_dst_gt_label"])
+        ).sum()
     )
     final_precision = (
-        float(final_pruned_cross / len(new_pruned)) if len(new_pruned) else 0.0
+        float(final_pruned_cross / final_pruned_labelled)
+        if final_pruned_labelled
+        else 0.0
     )
 
     stats: dict[str, int | float | bool] = {
@@ -358,14 +418,23 @@ def oracle_swap_edges(
         "input_pruned_edges": int(len(pruned_edges)),
         "normalized_refined_edges": int(len(refined)),
         "normalized_pruned_edges": int(len(pruned)),
+        "labelled_refined_edges": int(refined_labelled_mask.sum()),
+        "labelled_pruned_edges": n_pruned_labelled,
+        "missing_label_refined_edges": int((~refined_labelled_mask).sum()),
+        "missing_label_pruned_edges": int((~pruned_labelled_mask).sum()),
+        "ignore_missing_label_edges": bool(ignore_missing_label_edges),
         "current_pruned_gt_cross_edges": current_tp,
-        "current_pruned_precision": float(current_tp / n_pruned) if n_pruned else 0.0,
+        "current_pruned_precision": (
+            float(current_tp / n_pruned_labelled) if n_pruned_labelled else 0.0
+        ),
         "target_pruned_precision": float(target_pruned_precision),
         "target_pruned_gt_cross_edges": target_tp,
         "needed_swaps": int(needed_swaps),
         "performed_swaps": int(feasible_swaps),
         "available_same_domain_pruned_edges": int(len(pruned_same_indices)),
         "available_gt_cross_refined_edges": int(len(refined_cross_indices)),
+        "final_labelled_pruned_edges": final_pruned_labelled,
+        "final_labelled_refined_edges": final_refined_labelled,
         "final_pruned_gt_cross_edges": final_pruned_cross,
         "final_pruned_precision": final_precision,
         "final_refined_gt_cross_edges": final_refined_cross,
@@ -410,6 +479,7 @@ def main() -> None:
             id_col=args.id_col,
             label_col=args.label_col,
             directed=args.directed,
+            ignore_missing_label_edges=args.ignore_missing_label_edges,
         )
         output_refined_edges.parent.mkdir(parents=True, exist_ok=True)
         args.output_pruned_edges.parent.mkdir(parents=True, exist_ok=True)
@@ -430,6 +500,7 @@ def main() -> None:
             id_col=args.id_col,
             label_col=args.label_col,
             directed=args.directed,
+            ignore_missing_label_edges=args.ignore_missing_label_edges,
         )
         args.output_edges.parent.mkdir(parents=True, exist_ok=True)
         filtered_edges.to_csv(args.output_edges, index=False)
