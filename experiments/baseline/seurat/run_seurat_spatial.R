@@ -137,6 +137,9 @@ prepare_visium_input_dir <- function(data_dir, sample_out, counts_file, coordina
   }
 
   prepared_dir <- file.path(sample_out, "_seurat_visium_input")
+  if (dir.exists(prepared_dir)) {
+    unlink(prepared_dir, recursive = TRUE, force = TRUE)
+  }
   prepared_spatial <- file.path(prepared_dir, "spatial")
   dir.create(prepared_spatial, recursive = TRUE, showWarnings = FALSE)
 
