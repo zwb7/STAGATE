@@ -49,12 +49,12 @@ Run one slice at a time. First run Seurat clustering and ARI calculation:
 
 ```bash
 Rscript experiments/baseline/seurat/run_seurat_spatial.R \
-  --data_dir /path/to/DLPFC/151507 \
-  --sample_id 151507 \
-  --out_dir results/seurat/dlpfc \
+  --data_dir /data1/zhangwenbo/Code/Dataset/LIBD/151674 \
+  --sample_id 151674 \
+  --out_dir results/seurat \
   --resolution 0.5 \
   --dims 1:30 \
-  --ground_truth /path/to/DLPFC/151507/metadata.txt \
+  --ground_truth /data1/zhangwenbo/Code/Dataset/LIBD/151674/151674_truth.txt \
   --ground_truth_no_header
 ```
 

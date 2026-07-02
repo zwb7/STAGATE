@@ -1,4 +1,4 @@
-﻿suppressPackageStartupMessages({
+suppressPackageStartupMessages({
   library(Seurat)
   library(mclust)
   library(optparse)
