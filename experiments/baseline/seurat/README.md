@@ -1,7 +1,8 @@
 ﻿# Seurat Spatial Clustering Baseline
 
-This folder contains a Seurat-based clustering and visualization workflow for
-10x Visium-style spatial transcriptomics data such as DLPFC slices and HBC.
+This folder contains a Seurat-based clustering workflow plus Scanpy spatial
+visualization for 10x Visium-style spatial transcriptomics data such as DLPFC
+slices and HBC.
 
 The script is intended as a comparison baseline. It does not modify the official
 STAGATE implementation in `STAGATE_pyG/`.
@@ -44,7 +45,7 @@ ambiguous alignment.
 
 ## DLPFC example
 
-Run one slice at a time, for example:
+Run one slice at a time. First run Seurat clustering and ARI calculation:
 
 ```bash
 Rscript experiments/baseline/seurat/run_seurat_spatial.R \
@@ -55,6 +56,23 @@ Rscript experiments/baseline/seurat/run_seurat_spatial.R \
   --dims 1:30 \
   --ground_truth /path/to/DLPFC/151507/metadata.txt \
   --ground_truth_no_header
+```
+
+The R script prints ARI to the terminal when ground truth is provided, for
+example:
+
+```text
+ARI: 0.512345
+```
+
+Then render PNG spatial visualizations with Scanpy `sc.pl.spatial`:
+
+```bash
+python experiments/baseline/seurat/plot_scanpy_spatial.py \
+  --data_dir /path/to/DLPFC/151507 \
+  --sample_id 151507 \
+  --metadata results/seurat/dlpfc/151507/metadata.csv \
+  --out_dir results/seurat/dlpfc
 ```
 
 If the TXT file has no header but uses non-default column meanings, the first
@@ -83,18 +101,27 @@ Rscript experiments/baseline/seurat/run_seurat_spatial.R \
   --out_dir results/seurat/hbc \
   --resolution 0.5 \
   --dims 1:30
+
+python experiments/baseline/seurat/plot_scanpy_spatial.py \
+  --data_dir /path/to/HBC \
+  --sample_id HBC \
+  --metadata results/seurat/hbc/HBC/metadata.csv \
+  --out_dir results/seurat/hbc
 ```
 
 ## Outputs
 
-For each sample, the script writes:
+For each sample, the R script writes:
 
-- `spatial_clusters.pdf`
-- `umap_clusters.pdf`
 - `metadata.csv`
 - `seurat_object.rds`
 - `params.json`
 - `sessionInfo.txt`
 - `metrics.csv`, only when ground truth is provided
+
+The Scanpy visualization script writes PNG files:
+
+- `spatial_clusters.png`
+- `spatial_ground_truth.png`, only when ground truth is available
 
 Generated results should remain under `results/` and should not be committed.

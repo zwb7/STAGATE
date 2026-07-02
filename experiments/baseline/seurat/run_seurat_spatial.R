@@ -1,6 +1,5 @@
 ﻿suppressPackageStartupMessages({
   library(Seurat)
-  library(ggplot2)
   library(mclust)
   library(optparse)
   library(jsonlite)
@@ -169,6 +168,7 @@ if (!is.null(opt$ground_truth)) {
     stop("No labeled spots available for ARI calculation.")
   }
   ari <- adjustedRandIndex(obj$seurat_clusters[valid], obj$ground_truth[valid])
+  cat(sprintf("ARI: %.6f\n", ari))
 
   write.csv(
     data.frame(
@@ -182,50 +182,8 @@ if (!is.null(opt$ground_truth)) {
     file.path(sample_out, "metrics.csv"),
     row.names = FALSE
   )
-}
-
-spatial_clusters <- SpatialDimPlot(
-  obj,
-  group.by = "seurat_clusters",
-  label = TRUE,
-  label.size = 3
-) + ggtitle(paste(opt$sample_id, "Seurat clusters"))
-
-ggsave(
-  file.path(sample_out, "spatial_clusters.pdf"),
-  spatial_clusters,
-  width = 7,
-  height = 7
-)
-
-umap_clusters <- DimPlot(
-  obj,
-  reduction = "umap",
-  group.by = "seurat_clusters",
-  label = TRUE
-) + ggtitle(paste(opt$sample_id, "UMAP"))
-
-ggsave(
-  file.path(sample_out, "umap_clusters.pdf"),
-  umap_clusters,
-  width = 7,
-  height = 6
-)
-
-if ("ground_truth" %in% colnames(obj@meta.data)) {
-  spatial_ground_truth <- SpatialDimPlot(
-    obj,
-    group.by = "ground_truth",
-    label = TRUE,
-    label.size = 3
-  ) + ggtitle(paste(opt$sample_id, "ground truth"))
-
-  ggsave(
-    file.path(sample_out, "spatial_ground_truth.pdf"),
-    spatial_ground_truth,
-    width = 7,
-    height = 7
-  )
+} else {
+  cat("ARI: NA (ground truth not provided)\n")
 }
 
 write.csv(obj@meta.data, file.path(sample_out, "metadata.csv"))
